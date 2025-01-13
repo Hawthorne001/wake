@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache, reduce
 from operator import or_
 from typing import TYPE_CHECKING, Iterator, List, Set, Tuple, Union
@@ -9,6 +10,7 @@ from wake.ir.ast import SolcUncheckedBlock
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.statements.abc import StatementAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..expressions.abc import ExpressionAbc
@@ -35,7 +37,9 @@ class UncheckedBlock(StatementAbc):
     """
 
     _ast_node: SolcUncheckedBlock
-    _parent: Union[Block, DoWhileStatement, ForStatement, IfStatement, WhileStatement]
+    _parent: weakref.ReferenceType[
+        Union[Block, DoWhileStatement, ForStatement, IfStatement, WhileStatement]
+    ]
 
     _statements: List[StatementAbc]
 
@@ -64,7 +68,15 @@ class UncheckedBlock(StatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[StatementAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield from self._statements
 
     @property
     def statements(self) -> Tuple[StatementAbc, ...]:
@@ -77,7 +89,7 @@ class UncheckedBlock(StatementAbc):
         return tuple(self._statements)
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

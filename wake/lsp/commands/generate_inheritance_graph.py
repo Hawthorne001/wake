@@ -24,7 +24,7 @@ async def generate_inheritance_graph_handler(
         logger.debug(
             f"Inheritance graph for contract {contract_info[1]} in file {contract_info[0]} requested"
         )
-    await context.compiler.output_ready.wait()
+    await context.compiler.compilation_ready.wait()
 
     queue: Deque[Tuple[ContractDefinition, bool, bool]] = deque()
     visited: Set[ContractDefinition] = set()
@@ -89,9 +89,11 @@ async def generate_inheritance_graph_handler(
             )
             line += 1
             column += 1
-            node_attrs[
-                "URL"
-            ] = f"vscode://file/{contract.source_unit.file}:{line}:{column}"
+            node_attrs["URL"] = context.config.general.link_format.format(
+                path=str(contract.source_unit.file),
+                line=line,
+                col=column,
+            )
 
         g.node(node_id, contract.canonical_name, **node_attrs)
 

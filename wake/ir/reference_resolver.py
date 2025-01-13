@@ -63,30 +63,66 @@ class ReferenceResolver:
     _ordered_nodes: DefaultDict[bytes, Dict[AstNodeId, Tuple[Path, int]]]
     _ordered_nodes_inverted: DefaultDict[bytes, Dict[Tuple[Path, int], AstNodeId]]
     _registered_source_files: DefaultDict[bytes, Dict[int, Path]]
-    _registered_nodes: Dict[Tuple[Path, int], SolidityAbc]
+    _registered_nodes: Dict[Path, Dict[int, SolidityAbc]]
     _post_process_callbacks: List[PostProcessQueueItem]
     _destroy_callbacks: DefaultDict[Path, List[Callable[[], None]]]
     _global_symbol_references: DefaultDict[
         GlobalSymbol, List[Union[Identifier, MemberAccess]]
     ]
     _node_types: Dict[Path, Dict[int, str]]
+    _lsp: bool
 
-    def __init__(self):
+    def __init__(self, lsp: bool):
         self._ordered_nodes = defaultdict(dict)
         self._ordered_nodes_inverted = defaultdict(dict)
         self._registered_source_files = defaultdict(dict)
-        self._registered_nodes = {}
+        self._registered_nodes = defaultdict(dict)
         self._post_process_callbacks = []
         self._destroy_callbacks = defaultdict(list)
         self._global_symbol_references = defaultdict(list)
         self._node_types = {}
+        self._lsp = lsp
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if self._lsp:
+            del state["_registered_nodes"]
+            del state["_post_process_callbacks"]
+            del state["_destroy_callbacks"]
+            del state["_global_symbol_references"]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self._lsp:
+            self._registered_nodes = defaultdict(dict)
+            self._post_process_callbacks = []
+            self._destroy_callbacks = defaultdict(list)
+            self._global_symbol_references = defaultdict(list)
+
+    def clear_registered_nodes(self, paths: Iterable[Path]) -> None:
+        for path in paths:
+            self._registered_nodes.pop(path, None)
 
     def clear_indexed_nodes(self, paths: Iterable[Path]) -> None:
         for path in paths:
             self._node_types.pop(path, None)
 
+    def clear_all_registered_nodes(self) -> None:
+        self._registered_nodes.clear()
+
     def clear_all_indexed_nodes(self) -> None:
         self._node_types.clear()
+
+    def clear_cu_metadata(self, cu_hash: bytes) -> None:
+        self._ordered_nodes.pop(cu_hash, None)
+        self._ordered_nodes_inverted.pop(cu_hash, None)
+        self._registered_source_files.pop(cu_hash, None)
+
+    def clear_all_cu_metadata(self) -> None:
+        self._ordered_nodes.clear()
+        self._ordered_nodes_inverted.clear()
+        self._registered_source_files.clear()
 
     def index_nodes(self, root_node: AstSolc, path: Path, cu_hash: bytes) -> None:
         if path not in self._node_types:
@@ -104,19 +140,17 @@ class ReferenceResolver:
         for node in root_node:
             if check:
                 skip = False
+                prev_other_type = self._node_types[path].get(index - 1)
                 other_type = self._node_types[path].get(index)
 
                 while other_type != node.node_type:
-                    if other_type == "StructuredDocumentation":
-                        index += 1
-                        other_type = self._node_types[path].get(index)
-                        continue
-                    elif node.node_type == "StructuredDocumentation":
-                        skip = True
-                        prev_type = "StructuredDocumentation"
-                        break
-                    elif (
-                        self._node_types[path][index - 1] == "UserDefinedTypeName"
+                    # in rare cases, the following 2 ASTs may exist for the same file
+                    #     UserDefinedTypeName -> IdentifierPath
+                    #     UserDefinedTypeName -> StructuredDocumentation
+                    #
+                    # In such cases, UserDefinedTypeName normalization must take precedence over StructuredDocumentation normalization
+                    if (
+                        prev_other_type == "UserDefinedTypeName"
                         and prev_type == "UserDefinedTypeName"
                     ):
                         if other_type == "IdentifierPath":
@@ -127,11 +161,27 @@ class ReferenceResolver:
                             skip = True
                             prev_type = "IdentifierPath"
                             break
+                    elif other_type == "StructuredDocumentation":
+                        index += 1
+                        other_type = self._node_types[path].get(index)
+                        continue
+                    elif node.node_type == "StructuredDocumentation":
+                        skip = True
+                        prev_type = "StructuredDocumentation"
+                        break
                     elif (
                         other_type == "IdentifierPath"
                         and node.node_type == "UserDefinedTypeName"
                     ) or (
                         other_type == "UserDefinedTypeName"
+                        and node.node_type == "IdentifierPath"
+                    ):
+                        break
+                    elif (
+                        other_type == "IdentifierPath"
+                        and node.node_type == "Identifier"
+                    ) or (
+                        other_type == "Identifier"
                         and node.node_type == "IdentifierPath"
                     ):
                         break
@@ -187,8 +237,8 @@ class ReferenceResolver:
     def register_node(self, node: SolidityAbc, node_id: AstNodeId, cu_hash: bytes):
         assert cu_hash in self._ordered_nodes
         assert node_id in self._ordered_nodes[cu_hash]
-        node_path_order = self._ordered_nodes[cu_hash][node_id]
-        self._registered_nodes[node_path_order] = node
+        path, order = self._ordered_nodes[cu_hash][node_id]
+        self._registered_nodes[path][order] = node
 
     def resolve_node(self, node_id: AstNodeId, cu_hash: bytes) -> SolidityAbc:
         """
@@ -201,8 +251,8 @@ class ReferenceResolver:
         Returns:
             IR node for the given AST node ID in the given CU
         """
-        node_path_order = self._ordered_nodes[cu_hash][node_id]
-        return self._registered_nodes[node_path_order]
+        path, order = self._ordered_nodes[cu_hash][node_id]
+        return self._registered_nodes[path][order]
 
     def resolve_source_file_id(self, source_file_id: int, cu_hash: bytes) -> Path:
         """

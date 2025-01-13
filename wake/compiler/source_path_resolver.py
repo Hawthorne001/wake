@@ -30,9 +30,9 @@ class SourcePathResolver:
         for include_path in itertools.chain(
             [self.__config.project_root_path],
             self.__config.compiler.solc.include_paths,
-            [Path(__file__).parent.parent / "contracts"],
+            [self.__config.wake_contracts_path],
         ):
-            path = include_path / source_unit_name
+            path = Path(include_path / source_unit_name)
             if path.is_file():
                 matching_paths.append(path)
             elif path in virtual_files:
@@ -57,7 +57,7 @@ class SourcePathResolver:
         for include_path in itertools.chain(
             [self.__config.project_root_path],
             self.__config.compiler.solc.include_paths,
-            [Path(__file__).parent.parent / "contracts"],
+            [self.__config.wake_contracts_path],
         ):
             path = include_path / source_unit_name
             if path == file:

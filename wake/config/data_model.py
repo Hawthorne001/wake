@@ -1,10 +1,20 @@
 import re
 from dataclasses import astuple
-from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Union
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Dict, FrozenSet, Iterable, List, Optional
 
-from pydantic import BaseModel, Extra, Field, validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+)
 from pydantic.dataclasses import dataclass
+from pydantic.functional_validators import BeforeValidator
+from typing_extensions import Annotated
 
 from wake.core.enums import EvmVersionEnum
 from wake.core.solidity_version import SolidityVersion
@@ -12,12 +22,20 @@ from wake.utils import StrEnum
 
 
 class WakeConfigModel(BaseModel):
-    class Config:
-        allow_mutation = False
-        json_encoders = {
-            SolidityVersion: str,
-        }
-        extra = Extra.forbid
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
+
+
+def normalize_paths(paths: Iterable[str], info: ValidationInfo) -> FrozenSet[PurePath]:
+    if info.context and info.context.get("paths_mode") is not None:
+        if info.context["paths_mode"] == "Windows":
+            return frozenset(PureWindowsPath(path) for path in paths)
+        else:
+            return frozenset(PurePosixPath(path) for path in paths)
+    else:
+        return frozenset(Path(path).resolve() for path in paths)
 
 
 @dataclass
@@ -76,12 +94,43 @@ class SolcOptimizerConfig(WakeConfigModel):
     )
 
 
+class MetadataBytecodeHashEnum(StrEnum):
+    NONE = "none"
+    IPFS = "ipfs"
+    BZZR1 = "bzzr1"
+
+
+class SolcMetadataConfig(WakeConfigModel):
+    append_CBOR: Optional[bool] = None
+    use_literal_content: Optional[bool] = None
+    bytecode_hash: Optional[MetadataBytecodeHashEnum] = None
+
+
+def convert_remapping(v):
+    if isinstance(v, SolcRemapping):
+        return v
+    elif isinstance(v, dict):
+        return SolcRemapping(**v)
+
+    remapping_re = re.compile(
+        r"(?:(?P<context>[^:\s]+)?:)?(?P<prefix>[^\s=]+)=(?P<target>[^\s]+)?"
+    )
+    match = remapping_re.match(v)
+    assert match, f"`{v}` is not a valid solc remapping."
+
+    groupdict = match.groupdict()
+    context = groupdict["context"]
+    prefix = groupdict["prefix"]
+    target = groupdict["target"]
+    return SolcRemapping(context=context, prefix=prefix, target=target)
+
+
 class SolcConfig(WakeConfigModel):
-    allow_paths: FrozenSet[Path] = frozenset()
+    allow_paths: FrozenSet[PurePath] = frozenset()
     """Wake should set solc `--allow-paths` automatically. This option allows to specify additional allowed paths."""
     evm_version: Optional[EvmVersionEnum] = None
     """Version of the EVM to compile for. Leave unset to let the solc decide."""
-    exclude_paths: FrozenSet[Path] = Field(
+    exclude_paths: FrozenSet[PurePath] = Field(
         default_factory=lambda: frozenset(
             [
                 Path.cwd() / "node_modules",
@@ -96,7 +145,7 @@ class SolcConfig(WakeConfigModel):
     """
     Solidity files in these paths are excluded from compilation unless imported from a non-excluded file.
     """
-    include_paths: FrozenSet[Path] = Field(
+    include_paths: FrozenSet[PurePath] = Field(
         default_factory=lambda: frozenset([Path.cwd() / "node_modules"])
     )
     """
@@ -106,7 +155,13 @@ class SolcConfig(WakeConfigModel):
     """
     Optimizer config options.
     """
-    remappings: List[SolcRemapping] = []
+    remappings: List[
+        Annotated[
+            SolcRemapping,
+            BeforeValidator(convert_remapping),
+            PlainSerializer(lambda r: str(r), when_used="json"),
+        ]
+    ] = []
     """
     Remappings to apply during compilation.
     """
@@ -118,34 +173,33 @@ class SolcConfig(WakeConfigModel):
     """
     Use new IR-based compiler pipeline.
     """
+    metadata: SolcMetadataConfig = Field(default_factory=SolcMetadataConfig)
+    """
+    Metadata config options.
+    """
 
-    @validator("allow_paths", pre=True, each_item=True)
-    def set_allow_path(cls, v):
-        return Path(v).resolve()
+    _normalize_paths = field_validator(
+        "allow_paths", "include_paths", "exclude_paths", mode="before"
+    )(normalize_paths)
 
-    @validator("exclude_paths", pre=True, each_item=True)
-    def set_exclude_paths(cls, v):
-        return Path(v).resolve()
+    @field_serializer("target_version", when_used="json")
+    def serialize_target_version(self, version: Optional[SolidityVersion], info):
+        return str(version) if version is not None else None
 
-    @validator("include_paths", pre=True, each_item=True)
-    def set_include_path(cls, v):
-        return Path(v).resolve()
 
-    @validator("remappings", pre=True, each_item=True)
-    def set_remapping(cls, v):
-        if isinstance(v, SolcRemapping):
-            return v
-        remapping_re = re.compile(
-            r"(?:(?P<context>[^:\s]+)?:)?(?P<prefix>[^\s=]+)=(?P<target>[^\s]+)?"
-        )
-        match = remapping_re.match(v)
-        assert match, f"`{v}` is not a valid solc remapping."
+class SubprojectConfig(WakeConfigModel):
+    paths: FrozenSet[PurePath] = frozenset()
+    target_version: Optional[SolidityVersion] = None
+    evm_version: Optional[EvmVersionEnum] = None
+    optimizer: SolcOptimizerConfig = Field(default_factory=SolcOptimizerConfig)
+    via_IR: Optional[bool] = None
+    metadata: SolcMetadataConfig = Field(default_factory=SolcMetadataConfig)
 
-        groupdict = match.groupdict()
-        context = groupdict["context"]
-        prefix = groupdict["prefix"]
-        target = groupdict["target"]
-        return SolcRemapping(context=context, prefix=prefix, target=target)
+    _normalize_paths = field_validator("paths", mode="before")(normalize_paths)
+
+    @field_serializer("target_version", when_used="json")
+    def serialize_target_version(self, version: Optional[SolidityVersion], info):
+        return str(version) if version is not None else None
 
 
 class FindReferencesConfig(WakeConfigModel):
@@ -159,6 +213,26 @@ class CodeLensConfig(WakeConfigModel):
     enable: bool = True
     """
     Show code lenses.
+    """
+    sort_tag_priority: List[str] = [
+        "lsp-references",
+        "lsp-selectors",
+        "lsp-inheritance-graph",
+        "lsp-linearized-inheritance-graph",
+    ]
+    """
+    Order of code lens with the same start and end position based on sort tags used in detectors/printers. Sort tags default to the printer/detector name.
+    """
+
+
+class InlayHintsConfig(WakeConfigModel):
+    enable: bool = True
+    """
+    Show inlay hints.
+    """
+    sort_tag_priority: List[str] = []
+    """
+    Order of inlay hints with the same position based on sort tags used in detectors/printers. Sort tags default to the printer/detector name.
     """
 
 
@@ -182,7 +256,7 @@ class DetectorsConfig(WakeConfigModel):
     """
     Names of detectors that should only be loaded.
     """
-    ignore_paths: FrozenSet[Path] = Field(
+    ignore_paths: FrozenSet[PurePath] = Field(
         default_factory=lambda: frozenset(
             [
                 Path.cwd() / "venv",
@@ -195,7 +269,7 @@ class DetectorsConfig(WakeConfigModel):
     Detections in these paths must be ignored under all circumstances.
     Useful for ignoring detections in Solidity test files.
     """
-    exclude_paths: FrozenSet[Path] = Field(
+    exclude_paths: FrozenSet[PurePath] = Field(
         default_factory=lambda: frozenset(
             [
                 Path.cwd() / "node_modules",
@@ -209,17 +283,13 @@ class DetectorsConfig(WakeConfigModel):
     Useful for ignoring detections in dependencies.
     """
 
-    @validator("ignore_paths", pre=True, each_item=True)
-    def set_ignore_paths(cls, v):
-        return Path(v).resolve()
-
-    @validator("exclude_paths", pre=True, each_item=True)
-    def set_exclude_paths(cls, v):
-        return Path(v).resolve()
+    _normalize_paths = field_validator("ignore_paths", "exclude_paths", mode="before")(
+        normalize_paths
+    )
 
 
 # namespace for detector configs
-class DetectorConfig(WakeConfigModel, extra=Extra.allow):
+class DetectorConfig(WakeConfigModel, extra="allow"):
     """
     Namespace for detector-specific config options.
     Each attribute should be named after the detector name and hold a dictionary with string keys matching the Click option names.
@@ -242,6 +312,10 @@ class LspConfig(WakeConfigModel):
     find_references: FindReferencesConfig = Field(default_factory=FindReferencesConfig)
     """
     Find references config options.
+    """
+    inlay_hints: InlayHintsConfig = Field(default_factory=InlayHintsConfig)
+    """
+    Inlay hints config options.
     """
 
 
@@ -366,6 +440,7 @@ class GeneralConfig(WakeConfigModel):
             "value",
             "return_value",
             "error",
+            "events",
         ]
     )
     """
@@ -381,16 +456,23 @@ class GeneralConfig(WakeConfigModel):
     """
 
 
-# currently unused
 class PrintersConfig(WakeConfigModel):
     """
     Holds general printer config options for all printers.
-    Currently unused.
+    """
+
+    exclude: FrozenSet[str] = frozenset()
+    """
+    Names of printers that should not be loaded.
+    """
+    only: Optional[FrozenSet[str]] = None
+    """
+    Names of printers that should only be loaded.
     """
 
 
 # namespace for printer configs
-class PrinterConfig(WakeConfigModel, extra=Extra.allow):
+class PrinterConfig(WakeConfigModel, extra="allow"):
     """
     Namespace for printer-specific config options.
     Each attribute should be named after the printer name and hold a dictionary with string keys matching the Click option names.
@@ -398,9 +480,10 @@ class PrinterConfig(WakeConfigModel, extra=Extra.allow):
 
 
 class TopLevelConfig(WakeConfigModel):
-    subconfigs: List[Path] = []
+    subconfigs: List[Annotated[Path, BeforeValidator(lambda p: Path(p).resolve())]] = []
     api_keys: Dict[str, str] = {}
     compiler: CompilerConfig = Field(default_factory=CompilerConfig)
+    subproject: Dict[str, SubprojectConfig] = {}
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
@@ -410,7 +493,3 @@ class TopLevelConfig(WakeConfigModel):
     printers: PrintersConfig = Field(default_factory=PrintersConfig)
     printer: PrinterConfig = Field(default_factory=PrinterConfig)
     general: GeneralConfig = Field(default_factory=GeneralConfig)
-
-    @validator("subconfigs", pre=True, each_item=True)
-    def set_subconfig(cls, v):
-        return Path(v).resolve()

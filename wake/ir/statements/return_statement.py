@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
 
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
+from wake.utils.decorators import weak_self_lru_cache
 
 from .abc import StatementAbc
 
@@ -37,13 +39,15 @@ class Return(StatementAbc):
     """
 
     _ast_node: SolcReturn
-    _parent: Union[
-        Block,
-        DoWhileStatement,
-        ForStatement,
-        IfStatement,
-        UncheckedBlock,
-        WhileStatement,
+    _parent: weakref.ReferenceType[
+        Union[
+            Block,
+            DoWhileStatement,
+            ForStatement,
+            IfStatement,
+            UncheckedBlock,
+            WhileStatement,
+        ]
     ]
 
     _function_return_parameters: Optional[AstNodeId]
@@ -78,7 +82,16 @@ class Return(StatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        if self._expression is not None:
+            yield self._expression
 
     @property
     def function_return_parameters(self) -> Optional[ParameterList]:
@@ -116,7 +129,7 @@ class Return(StatementAbc):
         return self._expression
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

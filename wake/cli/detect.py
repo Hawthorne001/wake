@@ -4,7 +4,7 @@ import asyncio
 import logging
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import (
     TYPE_CHECKING,
     AbstractSet,
@@ -149,9 +149,9 @@ class DetectCli(click.RichGroup):  # pyright: ignore reportPrivateImportUsage
         return frozenset(self._detector_collisions)
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        self.formatter.config.commands_panel_title = "Detectors"
+        formatter.config.commands_panel_title = "Detectors"
         super().format_help(ctx, formatter)
-        self.formatter.config.commands_panel_title = "Commands"
+        formatter.config.commands_panel_title = "Commands"
 
     def add_verified_plugin_path(self, path: Path) -> None:
         import tomli
@@ -393,13 +393,17 @@ async def detect_(
     theme: str,
     watch: bool,
     ignore_disable_overrides: bool,
+    import_json: Optional[str],
 ):
+    import glob
+    import json
     import os
 
     from jschema_to_python.to_json import to_json
     from rich.terminal_theme import DEFAULT_TERMINAL_THEME, SVG_EXPORT_THEME
     from watchdog.observers import Observer
 
+    from wake.config import WakeConfig
     from wake.detectors.api import (
         DetectorConfidence,
         DetectorImpact,
@@ -413,6 +417,7 @@ async def detect_(
     from ..compiler.compiler import CompilationFileSystemEventHandler
     from ..compiler.solc_frontend import SolcOutputError, SolcOutputErrorSeverityEnum
     from ..utils.file_utils import is_relative_to
+    from ..utils.version import get_package_version
     from .console import console
 
     severity_map: Dict[DetectorImpact, Dict[DetectorConfidence, int]] = {
@@ -563,32 +568,116 @@ async def detect_(
             (config.project_root_path / "wake-detections.sarif").write_text(
                 to_json(log)
             )
+        elif export == "json":
+            def process_detection(detection: Detection) -> Dict[str, Any]:
+                start_line, start_col = detection.ir_node.source_unit.get_line_col_from_byte_offset(detection.ir_node.byte_location[0])
+                end_line, end_col = detection.ir_node.source_unit.get_line_col_from_byte_offset(detection.ir_node.byte_location[1])
+
+                source_unit = detection.ir_node.source_unit
+                assert source_unit._lines_index is not None
+                start_line_index = max(0, start_line - 4)
+                end_line_index = min(len(source_unit._lines_index), start_line + 3)
+
+                source = ""
+                for i in range(start_line_index, end_line_index):
+                    source += source_unit._lines_index[i][0].decode("utf-8")
+
+                ret = {
+                    "message":  detection.message,
+                    "location": {
+                        "path": str(source_unit.file),
+                        "source": source.rstrip(),
+                        "source_start_line": start_line_index + 1,
+                        "source_unit_name": source_unit.source_unit_name,
+                        "start_offset": detection.ir_node.byte_location[0],
+                        "end_offset": detection.ir_node.byte_location[1],
+                        "start_line": start_line,
+                        "start_col": start_col,
+                        "end_line": end_line,
+                        "end_col": end_col,
+                    }
+                }
+                if detection.subdetections:
+                    ret["subdetections"] = [process_detection(d) for d in detection.subdetections]
+
+                return ret
+
+            (config.project_root_path / ".wake").mkdir(parents=True, exist_ok=True)
+
+            data = []
+            for detector_name, detection in all_detections:
+                data.append({
+                    "detector_name": detector_name,
+                    "impact": detection.impact.value,
+                    "confidence": detection.confidence.value,
+                    "uri": detection.uri,
+                    "detection": process_detection(detection.detection),
+                })
+
+            (config.project_root_path / ".wake" / "detections.json").write_text(
+                to_json(data)
+            )
 
         console.record = False
 
         if not watch:
             sys.exit(0 if len(all_detections) == 0 else 3)
 
-    sol_files: Set[Path] = set()
-    start = time.perf_counter()
-    with console.status("[bold green]Searching for *.sol files...[/]"):
-        for file in config.project_root_path.rglob("**/*.sol"):
-            if (
-                not any(
-                    is_relative_to(file, p) for p in config.compiler.solc.exclude_paths
-                )
-                and file.is_file()
-            ):
-                sol_files.add(file)
-    end = time.perf_counter()
-    console.log(
-        f"[green]Found {len(sol_files)} *.sol files in [bold green]{end - start:.2f} s[/bold green][/]"
-    )
+    if import_json is None:
+        sol_files: Set[Path] = set()
+        modified_files: Dict[Path, bytes] = {}
+        start = time.perf_counter()
+        with console.status("[bold green]Searching for *.sol files...[/]"):
+            for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+                file = Path(f)
+                if (
+                    not any(
+                        is_relative_to(file, p) for p in config.compiler.solc.exclude_paths
+                    )
+                    and file.is_file()
+                ):
+                    sol_files.add(file)
+        end = time.perf_counter()
+        console.log(
+            f"[green]Found {len(sol_files)} *.sol files in [bold green]{end - start:.2f} s[/bold green][/]"
+        )
+    else:
+        with open(import_json, "r") as f:
+            loaded = json.load(f)
+
+        if loaded["version"] != get_package_version("eth-wake"):
+            raise click.BadParameter(f"JSON file was created with version {loaded['version']} of eth-wake, while the current version is {get_package_version('eth-wake')}")
+
+        if loaded["system"] == "Windows":
+            wake_contracts_path = PureWindowsPath(loaded["wake_contracts_path"])
+            original_project_root = PureWindowsPath(loaded["project_root"])
+        else:
+            wake_contracts_path = PurePosixPath(loaded["wake_contracts_path"])
+            original_project_root = PurePosixPath(loaded["project_root"])
+
+        config = WakeConfig.fromdict(loaded["config"], wake_contracts_path=wake_contracts_path, paths_mode=loaded["system"])
+
+        # add project root as an include path (for solc to resolve imports correctly)
+        if config.project_root_path != original_project_root:
+            config.update({"compiler": {"solc": {"include_paths": set(config.compiler.solc.include_paths) | {original_project_root}, }}}, [], paths_mode=loaded["system"])
+
+        modified_files = {
+            Path(path): source['content'].encode("utf-8") for path, source in loaded["sources"].items()
+        }
+        sol_files = {
+            path for path in modified_files.keys()
+            if not any(is_relative_to(path, p) for p in config.compiler.solc.exclude_paths)
+        }
 
     compiler = SolidityCompiler(config)
-    compiler.load(console=console)
+
+    if import_json is None:
+        compiler.load(console=console)
 
     if watch:
+        if import_json is not None:
+            raise click.BadParameter("Cannot watch when importing from JSON")
+
         fs_handler = CompilationFileSystemEventHandler(
             config,
             sol_files,
@@ -620,6 +709,7 @@ async def detect_(
         write_artifacts=not no_artifacts,
         console=console,
         no_warnings=True,
+        modified_files=modified_files,
     )
 
     assert compiler.latest_build_info is not None
@@ -655,8 +745,13 @@ async def detect_(
     help="Ignore compilation errors and detector exceptions.",
 )
 @click.option(
+    "--import-json",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Import project build info from JSON file.",
+)
+@click.option(
     "--export",
-    type=click.Choice(["svg", "html", "text", "ansi", "sarif"], case_sensitive=False),
+    type=click.Choice(["svg", "html", "text", "ansi", "sarif", "json"], case_sensitive=False),
     help="Export detections to file.",
 )
 @click.option(
@@ -792,6 +887,7 @@ def run_detect(
     ctx: click.Context,
     no_artifacts: bool,
     ignore_errors: bool,
+    import_json: Optional[str],
     export: Optional[str],
     theme: str,
     watch: bool,
@@ -881,6 +977,7 @@ def run_detect(
             theme,
             watch,
             ignore_disable_overrides,
+            import_json,
         )
     )
 

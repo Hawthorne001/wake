@@ -43,6 +43,7 @@ nav:
       - Installation: 'installation.md'
       - Configuration: 'configuration.md'
       - Compilation: 'compilation.md'
+      - Changelog: 'changelog.md'
       - Contributing: 'contributing.md'
   - Development and testing framework:
       - Overview: 'testing-framework/overview.md'
@@ -97,6 +98,13 @@ nav:
             - Imports graph: 'static-analysis/printers/imports-graph.md'
             - Inheritance graph: 'static-analysis/printers/inheritance-graph.md'
             - Inheritance tree: 'static-analysis/printers/inheritance-tree.md'
+            - LSP control flow graph: 'static-analysis/printers/lsp-control-flow-graph.md'
+            - LSP inheritance graph: 'static-analysis/printers/lsp-inheritance-graph.md'
+            - LSP linearized inheritance graph: 'static-analysis/printers/lsp-linearized-inheritance-graph.md'
+            - LSP OpenZeppelin docs: 'static-analysis/printers/lsp-openzeppelin-docs.md'
+            - LSP references: 'static-analysis/printers/lsp-references.md'
+            - LSP selectors: 'static-analysis/printers/lsp-selectors.md'
+            - LSP Yul definitions: 'static-analysis/printers/lsp-yul-definitions.md'
             - Modifiers: 'static-analysis/printers/modifiers.md'
             - State changes: 'static-analysis/printers/state-changes.md'
             - Storage layout: 'static-analysis/printers/storage-layout.md'
@@ -220,10 +228,8 @@ extra:
       link: https://github.com/Ackee-Blockchain/wake
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/WakeFramework
-    - icon: fontawesome/brands/telegram
-      link: https://t.me/wakeframework
-    - icon: fontawesome/brands/telegram
-      link: https://t.me/wake_group
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/YE9hntHvAe
   version:
     provider: mike
   analytics:
@@ -253,6 +259,7 @@ plugins:
       color: "#FFFFFF"
 
 markdown_extensions:
+  - attr_list
   - def_list
   - admonition
   - toc:

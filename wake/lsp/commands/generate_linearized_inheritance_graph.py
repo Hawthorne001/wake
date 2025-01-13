@@ -18,7 +18,7 @@ async def generate_linearized_inheritance_graph_handler(
     logger.debug(
         f"Linearized inheritance graph for contract {canonical_name} in file {uri} requested"
     )
-    await context.compiler.output_ready.wait()
+    await context.compiler.compilation_ready.wait()
 
     path = uri_to_path(uri).resolve()
 
@@ -56,9 +56,11 @@ async def generate_linearized_inheritance_graph_handler(
             )
             line += 1
             column += 1
-            node_attrs[
-                "URL"
-            ] = f"vscode://file/{contract.source_unit.file}:{line}:{column}"
+            node_attrs["URL"] = context.config.general.link_format.format(
+                path=str(contract.source_unit.file),
+                line=line,
+                col=column,
+            )
 
         g.node(node_id, contract.canonical_name, **node_attrs)
         if prev_node_id is not None:

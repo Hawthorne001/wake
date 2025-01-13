@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Extra, Field, root_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wake.core.enums import EvmVersionEnum
 from wake.utils import StrEnum
@@ -128,9 +128,12 @@ def _to_camel(s: str) -> str:
 
 
 class SolcInputModel(BaseModel):
-    class Config:
-        alias_generator = _to_camel
-        extra = Extra.allow
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
+        extra="allow",
+        protected_namespaces=(),
+    )
 
 
 class SolcInputSource(SolcInputModel):
@@ -138,7 +141,7 @@ class SolcInputSource(SolcInputModel):
     content: Optional[str] = None
     urls: Optional[List[str]] = None
 
-    @root_validator
+    @model_validator(mode="before")
     def content_or_urls_set(cls, values):
         content, urls = values.get("content"), values.get("urls")
         assert (content is None) != (
@@ -204,6 +207,7 @@ class SolcInputDebugSettings(SolcInputModel):
 
 
 class SolcInputMetadataSettings(SolcInputModel):
+    append_CBOR: Optional[bool] = Field(None, alias="appendCBOR")
     use_literal_content: Optional[bool] = None
     bytecode_hash: Optional[MetadataBytecodeHashEnum] = None
 

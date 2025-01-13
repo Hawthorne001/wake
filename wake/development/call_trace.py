@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import importlib
 import reprlib
 from collections import ChainMap
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    AbstractSet,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -20,7 +22,7 @@ import eth_abi.abi
 import eth_abi.exceptions
 import eth_utils
 from rich.console import Console
-from rich.highlighter import ReprHighlighter
+from rich.highlighter import RegexHighlighter
 from rich.text import Text
 from rich.tree import Tree
 
@@ -36,17 +38,43 @@ from .core import (
     Contract,
     Wei,
     fix_library_abi,
-    get_contracts_by_fqn,
     get_fqn_from_address,
     get_fqn_from_creation_code,
-    process_debug_trace_for_fqn_overrides,
 )
 from .globals import get_config, get_verbosity
 from .internal import read_from_memory
-from .utils import get_contract_info_from_explorer
+from .utils import get_name_abi_from_explorer
 
 if TYPE_CHECKING:
-    from .transactions import TransactionAbc
+    from wake.config import WakeConfig
+
+
+class ReprHighlighter(RegexHighlighter):
+    """Highlights the text typically produced from ``__repr__`` methods."""
+
+    base_style = "repr."
+    highlights = [
+        r"(?P<tag_start><)(?P<tag_name>[-\w.:|]*)(?P<tag_contents>[\w\W]*)(?P<tag_end>>)",
+        r'(?P<attrib_name>[\w_]{1,50})=(?P<attrib_value>"?[\w_]+"?)?',
+        r"(?P<brace>[][{}()])",
+        "|".join(
+            [
+                r"(?P<ipv4>[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})",
+                r"(?P<ipv6>([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4})",
+                r"(?P<eui64>(?:[0-9A-Fa-f]{1,2}-){7}[0-9A-Fa-f]{1,2}|(?:[0-9A-Fa-f]{1,2}:){7}[0-9A-Fa-f]{1,2}|(?:[0-9A-Fa-f]{4}\.){3}[0-9A-Fa-f]{4})",
+                r"(?P<eui48>(?:[0-9A-Fa-f]{1,2}-){5}[0-9A-Fa-f]{1,2}|(?:[0-9A-Fa-f]{1,2}:){5}[0-9A-Fa-f]{1,2}|(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4})",
+                r"(?P<uuid>[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})",
+                r"(?P<call>[\w.]*?)\(",
+                r"\b(?P<bool_true>True)\b|\b(?P<bool_false>False)\b|\b(?P<none>None)\b",
+                r"(?P<ellipsis>\.\.\.)",
+                r"(?P<number_complex>(?<!\w)(?:\-?[0-9]+\.?[0-9]*(?:e[-+]?\d+?)?)(?:[-+](?:[0-9]+\.?[0-9]*(?:e[-+]?\d+)?))?j)",
+                r"(?P<number>(?<!\w)-?[0-9]+\.?[0-9]*(e[-+]?\d+)?\b|0x[0-9a-fA-F]+|(?<=\.)[0-9a-fA-F]{2,})",
+                r"(?P<path>\B(/[-\w._+]+)*\/)(?P<filename>[-\w._+]*)?",
+                r"(?<![\\\w])(?P<str>b?'''.*?(?<!\\)'''|b?'.*?(?<!\\)'|b?\"\"\".*?(?<!\\)\"\"\"|b?\".*?(?<!\\)\")",
+                r"(?P<url>(file|https|http|ws|wss)://[-0-9a-zA-Z$_+!`(),.?/;:&=%#~@]*)",
+            ]
+        ),
+    ]
 
 
 def get_precompiled_info(
@@ -150,6 +178,27 @@ def get_precompiled_info(
         raise ValueError(f"Unknown precompiled contract address: {addr}")
 
 
+def _get_info_from_explorer(addr: Address, chain_id: int) -> Optional[Tuple[str, Dict]]:
+    try:
+        name, abi = get_name_abi_from_explorer(addr, chain_id)
+    except Exception:
+        return None
+
+    abi_dict = {}
+    # TODO library ABI is different and has to be fixed to compute the correct selector
+    # however, it is not possible to detect if a contract is a library or not without parsing the source code
+    for abi_item in abi:
+        if abi_item["type"] in {"constructor", "fallback", "receive"}:
+            abi_dict[abi_item["type"]] = abi_item
+        elif abi_item["type"] == "function":
+            abi_dict[eth_utils.abi.function_abi_to_4byte_selector(abi_item)] = abi_item
+        elif abi_item["type"] == "error":
+            abi_dict[eth_utils.abi.function_abi_to_4byte_selector(abi_item)] = abi_item
+        elif abi_item["type"] == "event":
+            abi_dict[eth_utils.abi.event_abi_to_log_topic(abi_item)] = abi_item
+    return name, abi_dict
+
+
 def _decode_precompiled(
     addr: Optional[Address], data: bytes
 ) -> Tuple[List[Any], List[Optional[str]]]:
@@ -174,47 +223,107 @@ def _decode_precompiled(
         raise ValueError(f"Unknown precompiled contract address: {addr}")
 
 
+def _normalize(arg, a, chain):
+    if a["type"] == "address":
+        acc = Account(Address(arg), chain)
+        if acc.label is not None:
+            return acc
+        else:
+            return Address(arg)
+    elif a["type"].endswith("]"):
+        if "internalType" in a:
+            assert a["internalType"].endswith("]")
+            prev_internal_type = a["internalType"]
+            a["internalType"] = "[".join(a["internalType"].split("[")[:-1])
+        prev_type = a["type"]
+        a["type"] = "[".join(a["type"].split("[")[:-1])
+
+        ret = [_normalize(x, a, chain) for x in arg]
+
+        a["type"] = prev_type
+        if "internalType" in a:
+            a["internalType"] = prev_internal_type
+
+        return ret
+    elif (
+        a["type"] == "uint8"
+        and "internalType" in a
+        and a["internalType"].startswith("enum")
+    ):
+        return CustomIntEnum(a["internalType"][5:], arg)
+    elif (
+        a["type"] == "tuple"
+        and "internalType" in a
+        and a["internalType"].startswith("struct")
+    ):
+        return CustomNamedTuple(
+            a["internalType"][7:],
+            [c["name"] for c in a["components"]],
+            *[
+                _normalize(arg[i], a["components"][i], chain)
+                for i in range(len(a["components"]))
+            ],
+        )
+    else:
+        return arg
+
+
 def _decode_args(
     abi, data, chain
 ) -> Tuple[Optional[List], Optional[List[Optional[str]]]]:
-    def normalize(arg, a):
-        if a["type"] == "address":
-            return Account(Address(arg), chain)
-        elif a["type"].endswith("]"):
-            assert a["internalType"].endswith("]")
-            prev_type = a["type"]
-            prev_internal_type = a["internalType"]
-            a["type"] = "[".join(a["type"].split("[")[:-1])
-            a["internalType"] = "[".join(a["internalType"].split("[")[:-1])
-            ret = [normalize(x, a) for x in arg]
-            a["type"] = prev_type
-            a["internalType"] = prev_internal_type
-            return ret
-        elif a["type"] == "uint8" and a["internalType"].startswith("enum"):
-            return CustomIntEnum(a["internalType"][5:], arg)
-        elif a["type"] == "tuple" and a["internalType"].startswith("struct"):
-            return CustomNamedTuple(
-                a["internalType"][7:],
-                [c["name"] for c in a["components"]],
-                *[
-                    normalize(arg[i], a["components"][i])
-                    for i in range(len(a["components"]))
-                ],
-            )
-        else:
-            return arg
-
     input_types = [
         eth_utils.abi.collapse_if_tuple(cast(Dict[str, Any], arg))
         for arg in fix_library_abi(abi)
     ]
     args = list(
-        normalize(arg, type)
+        _normalize(arg, type, chain)
         for arg, type in zip(eth_abi.abi.decode(input_types, data), abi)
     )
     arg_names = [arg["name"] for arg in abi]
 
     return args, arg_names
+
+
+def _decode_event_args(
+    abi, topics, data, chain
+) -> Tuple[Optional[List], Optional[List[Optional[str]]]]:
+    topic_index = 0
+    decoded_indexed = []
+    types = []
+    non_indexed_abi = []
+
+    for arg in fix_library_abi(abi):
+        if arg["indexed"]:
+            if arg["type"] in {"string", "bytes", "tuple"} or arg["type"].endswith("]"):
+                topic_type = "bytes32"
+            else:
+                topic_type = arg["type"]
+
+            decoded_indexed.append(
+                _normalize(
+                    eth_abi.abi.decode([topic_type], topics[topic_index])[0],
+                    arg,
+                    chain,
+                )
+            )
+            topic_index += 1
+        else:
+            types.append(eth_utils.abi.collapse_if_tuple(arg))
+            non_indexed_abi.append(arg)
+
+    decoded = list(
+        _normalize(arg, type, chain)
+        for arg, type in zip(eth_abi.abi.decode(types, data), non_indexed_abi)
+    )
+    merged = []
+
+    for arg in abi:
+        if arg["indexed"]:
+            merged.append(decoded_indexed.pop(0))
+        else:
+            merged.append(decoded.pop(0))
+
+    return merged, [arg["name"] for arg in abi]
 
 
 class CallTraceKind(StrEnum):
@@ -273,7 +382,7 @@ class CustomIntEnum(int):
 class CustomRepr(reprlib.Repr):
     def repr_CustomNamedTuple(self, obj, level):
         fields_str = ", ".join(
-            f"{name}={repr(value)}"
+            f"{name}={self.repr(value)}"
             for name, value in zip(
                 obj._field_names[: self.maxtuple], obj[: self.maxtuple]
             )
@@ -281,6 +390,16 @@ class CustomRepr(reprlib.Repr):
         if len(obj._field_names) > self.maxtuple:
             fields_str += ", ..."
         return f"{obj._tuple_name}({fields_str})"
+
+    def repr_bytes(self, obj, level):
+        return "0x" + self.repr(obj.hex())[1:-1]
+
+
+@dataclass
+class CallTraceEvent:
+    name: str
+    args: List[Any]
+    arg_names: List[Optional[str]]
 
 
 class CallTrace:
@@ -307,8 +426,12 @@ class CallTrace:
     _revert_data: Optional[bytes]
     _return_value: Optional[List]
     _return_names: Optional[List[Optional[str]]]
-    _abi: Dict[bytes, Any]  # used for error decoding
+    _abi: Dict[bytes, Any]  # used for error and event decoding
     _output_abi: Optional[List[Dict[str, Any]]]  # used for return value decoding
+    _events: List[CallTraceEvent]
+    _all_events: List[
+        CallTraceEvent
+    ]  # recursively, in correct order; only saved in root trace
 
     def __init__(
         self,
@@ -366,6 +489,8 @@ class CallTrace:
             "type": "error",
             "inputs": [{"internalType": "uint256", "name": "code", "type": "uint256"}],
         }
+        self._events = []
+        self._all_events = []
 
     def __str__(self):
         console = Console()
@@ -428,8 +553,21 @@ class CallTrace:
                 )
 
         arg_repr = CustomRepr()
-        arg_repr.maxstring = 64
-        arg_repr.maxother = 44
+        if get_verbosity() > 0:
+            arg_repr.maxlevel = 1_000_000
+            arg_repr.maxtuple = 1_000_000
+            arg_repr.maxlist = 1_000_000
+            arg_repr.maxarray = 1_000_000
+            arg_repr.maxdict = 1_000_000
+            arg_repr.maxset = 1_000_000
+            arg_repr.maxfrozenset = 1_000_000
+            arg_repr.maxdeque = 1_000_000
+            arg_repr.maxstring = 1_000_000
+            arg_repr.maxlong = 1_000_000
+            arg_repr.maxother = 1_000_000
+        else:
+            arg_repr.maxstring = 64
+            arg_repr.maxother = 44
 
         if "named_arguments" in options:
             if self.arguments is not None:
@@ -438,10 +576,7 @@ class CallTrace:
                 for i, (arg, arg_name) in enumerate(
                     zip(self.arguments, self.argument_names)
                 ):
-                    if get_verbosity() > 0:
-                        r = repr(arg)
-                    else:
-                        r = arg_repr.repr(arg)
+                    r = arg_repr.repr(arg)
 
                     if arg_name is not None and len(arg_name.strip()) > 0:
                         t = Text(f"{arg_name.strip()}={r}")
@@ -458,10 +593,7 @@ class CallTrace:
             if self.arguments is not None:
                 ret.append("(")
                 for i, arg in enumerate(self.arguments):
-                    if get_verbosity() > 0:
-                        t = Text(repr(arg))
-                    else:
-                        t = Text(arg_repr.repr(arg))
+                    t = Text(arg_repr.repr(arg))
                     ReprHighlighter().highlight(t)
                     ret.append_text(t)
                     if i < len(self.arguments) - 1:
@@ -516,10 +648,7 @@ class CallTrace:
                 for i, (arg, arg_name) in enumerate(
                     zip(self._return_value, self._return_names)
                 ):
-                    if get_verbosity() > 0:
-                        r = repr(arg)
-                    else:
-                        r = arg_repr.repr(arg)
+                    r = arg_repr.repr(arg)
 
                     if arg_name is not None and len(arg_name.strip()) > 0:
                         t = Text(f"{arg_name.strip()}={r}")
@@ -537,6 +666,25 @@ class CallTrace:
                 for i, (arg, arg_name) in enumerate(
                     zip(self.error_arguments or [], self._error_names or [])
                 ):
+                    r = arg_repr.repr(arg)
+
+                    if arg_name is not None and len(arg_name.strip()) > 0:
+                        t = Text(f"{arg_name.strip()}={r}")
+                    else:
+                        t = Text(r)
+                    ReprHighlighter().highlight(t)
+                    ret.append_text(t)
+                    if i < len(self.error_arguments or []) - 1:
+                        ret.append(", ")
+                ret.append(")")
+
+        if "events" in options:
+            for event in self._events:
+                ret.append("\n  ⚡️ ")
+                ret.append_text(
+                    Text.from_markup(f"[bright_yellow]{event.name}[/bright_yellow](")
+                )
+                for i, (arg, arg_name) in enumerate(zip(event.args, event.arg_names)):
                     if get_verbosity() > 0:
                         r = repr(arg)
                     else:
@@ -548,9 +696,201 @@ class CallTrace:
                         t = Text(r)
                     ReprHighlighter().highlight(t)
                     ret.append_text(t)
-                    if i < len(self.error_arguments or []) - 1:
+                    if i < len(event.args) - 1:
                         ret.append(", ")
                 ret.append(")")
+
+        return ret
+
+    @property
+    def error_string(self) -> Optional[str]:
+        if self._error_name is None:
+            return None
+
+        ret = f"{self._error_name}("
+        for i, (arg, arg_name) in enumerate(
+            zip(self.error_arguments or [], self._error_names or [])
+        ):
+            if arg_name is not None and len(arg_name.strip()) > 0:
+                ret += f"{arg_name.strip()}={repr(arg)}"
+            else:
+                ret += repr(arg)
+            if i < len(self.error_arguments or []) - 1:
+                ret += ", "
+        ret += ")"
+
+        return ret
+
+    @property
+    def event_strings(self) -> List[str]:
+        # all events recursively, in correct order, excluding events from reverting subtraces
+        ret = []
+        for event in self._all_events:
+            event_string = event.name + "("
+            for i, (arg, arg_name) in enumerate(zip(event.args, event.arg_names)):
+                if arg_name is not None and len(arg_name.strip()) > 0:
+                    event_string += f"{arg_name.strip()}={repr(arg)}"
+                else:
+                    event_string += repr(arg)
+
+                if i < len(event.args) - 1:
+                    event_string += ", "
+
+            event_string += ")"
+            ret.append(event_string)
+
+        return ret
+
+    def dict(self, config: WakeConfig) -> Dict[str, Union[Optional[str], List]]:
+        options = config.general.call_trace_options
+        ret: Dict[str, Union[Optional[str], List]] = {}
+
+        arg_repr = CustomRepr()
+        arg_repr.maxlevel = 1_000_000
+        arg_repr.maxtuple = 1_000_000
+        arg_repr.maxlist = 1_000_000
+        arg_repr.maxarray = 1_000_000
+        arg_repr.maxdict = 1_000_000
+        arg_repr.maxset = 1_000_000
+        arg_repr.maxfrozenset = 1_000_000
+        arg_repr.maxdeque = 1_000_000
+        arg_repr.maxstring = 1_000_000
+        arg_repr.maxlong = 1_000_000
+        arg_repr.maxother = 1_000_000
+
+        if "contract_name" in options:
+            ret["contract_name"] = self.contract_name or "Unknown"
+        else:
+            ret["contract_name"] = None
+
+        if "address" in options and self.address is not None:
+            ret["address"] = Account(self.address, self.chain).label or str(
+                self.address
+            )
+        else:
+            ret["address"] = None
+
+        if "function_name" in options:
+            if self.function_is_special:
+                ret["function_name"] = "<" + (self.function_name or "???") + ">"
+            else:
+                ret["function_name"] = self.function_name or "???"
+        else:
+            ret["function_name"] = None
+
+        if "named_arguments" in options:
+            if self.arguments is not None:
+                assert self.argument_names is not None
+                ret["arguments"] = "("
+                for i, (arg, arg_name) in enumerate(
+                    zip(self.arguments, self.argument_names)
+                ):
+                    if arg_name is not None and len(arg_name.strip()) > 0:
+                        ret["arguments"] += f"{arg_name.strip()}={arg_repr.repr(arg)}"
+                    else:
+                        ret["arguments"] += arg_repr.repr(arg)
+
+                    if i < len(self.arguments) - 1:
+                        ret["arguments"] += ", "
+                ret["arguments"] += ")"
+            else:
+                ret["arguments"] = "(???)"
+        elif "arguments" in options:
+            if self.arguments is not None:
+                ret["arguments"] = "("
+                for i, arg in enumerate(self.arguments):
+                    ret["arguments"] += arg_repr.repr(arg)
+                    if i < len(self.arguments) - 1:
+                        ret["arguments"] += ", "
+                ret["arguments"] += ")"
+            else:
+                ret["arguments"] = "(???)"
+        else:
+            ret["arguments"] = None
+
+        if "status" in options:
+            ret["status"] = "✓" if self.status else "✗"
+        else:
+            ret["status"] = None
+
+        if "call_type" in options:
+            ret["call_type"] = self.kind
+        else:
+            ret["call_type"] = None
+
+        if "value" in options:
+            ret["value"] = format_wei(self.value)
+        else:
+            ret["value"] = None
+
+        if "gas" in options:
+            ret["gas"] = f"{self.gas:,}"
+        else:
+            ret["gas"] = None
+
+        if "sender" in options and self.sender is not None:
+            ret["sender"] = str(self.sender)
+        else:
+            ret["sender"] = None
+
+        if (
+            "return_value" in options
+            and self._return_value is not None
+            and len(self._return_value) > 0
+        ):
+            assert self._return_names is not None
+
+            ret["return_value"] = ""
+            for i, (arg, arg_name) in enumerate(
+                zip(self._return_value, self._return_names)
+            ):
+                if arg_name is not None and len(arg_name.strip()) > 0:
+                    ret["return_value"] += f"{arg_name.strip()}={arg_repr.repr(arg)}"
+                else:
+                    ret["return_value"] += arg_repr.repr(arg)
+
+                if i < len(self._return_value) - 1:
+                    ret["return_value"] += ", "
+        else:
+            ret["return_value"] = None
+
+        if "error" in options and self._error_name is not None:
+            ret["error"] = self._error_name + "("
+
+            for i, (arg, arg_name) in enumerate(
+                zip(self.error_arguments or [], self._error_names or [])
+            ):
+                if arg_name is not None and len(arg_name.strip()) > 0:
+                    ret["error"] += f"{arg_name.strip()}={arg_repr.repr(arg)}"
+                else:
+                    ret["error"] += arg_repr.repr(arg)
+
+                if i < len(self.error_arguments or []) - 1:
+                    ret["error"] += ", "
+            ret["error"] += ")"
+        else:
+            ret["error"] = None
+
+        if "events" in options:
+            ret["events"] = []
+            for event in self._events:
+                event_string = event.name + "("
+
+                for i, (arg, arg_name) in enumerate(zip(event.args, event.arg_names)):
+                    if arg_name is not None and len(arg_name.strip()) > 0:
+                        event_string += f"{arg_name.strip()}={repr(arg)}"
+                    else:
+                        event_string += repr(arg)
+
+                    if i < len(event.args) - 1:
+                        event_string += ", "
+
+                event_string += ")"
+                ret["events"].append(event_string)
+        else:
+            ret["events"] = None
+
+        ret["subtraces"] = [sub.dict(config) for sub in self.subtraces]
 
         return ret
 
@@ -657,46 +997,35 @@ class CallTrace:
     @classmethod
     def from_debug_trace(
         cls,
-        tx: TransactionAbc,
         trace: Dict[str, Any],
         tx_params: TxParams,
-        gas_limit: int,
+        chain: Chain,
+        to: Optional[Account],
+        created_contract: Optional[Account],
+        fqn_overrides: ChainMap[Address, Optional[str]],
+        fqn_block_number: int,  # the last block before the tx (or call) to fetch fqn
+        all_fqns: AbstractSet[str],
+        fqn_to_contract_abi: Callable[[str], Tuple[Optional[Contract], Dict]],
     ):
         from .transactions import PanicCodeEnum
 
-        fqn_overrides: ChainMap[Address, Optional[str]] = ChainMap()
+        assert tx_params["gas"] != "auto"
 
-        # process fqn_overrides for all txs before this one in the same block
-        for i in range(tx.tx_index):
-            tx_before = tx.block.txs[i]
-            tx_before._fetch_debug_trace_transaction()
-            process_debug_trace_for_fqn_overrides(
-                tx_before,
-                tx_before._debug_trace_transaction,  # pyright: ignore reportGeneralTypeIssues
-                fqn_overrides,
-            )
-
-        assert len(fqn_overrides.maps) == 1
-
-        if tx.to is None:
+        if to is None:
             try:
-                origin_fqn, _ = get_fqn_from_creation_code(tx.data)
+                origin_fqn, _ = get_fqn_from_creation_code(tx_params["data"])
             except ValueError:
                 origin_fqn = None
         else:
-            if tx.to.address in fqn_overrides:
-                origin_fqn = fqn_overrides[tx.to.address]
+            if to.address in fqn_overrides:
+                origin_fqn = fqn_overrides[to.address]
             else:
-                origin_fqn = get_fqn_from_address(
-                    tx.to.address, tx.block.number - 1, tx.chain
-                )
+                origin_fqn = get_fqn_from_address(to.address, fqn_block_number, chain)
 
         contracts = [origin_fqn]
         values = [0 if "value" not in tx_params else tx_params["value"]]
         assert "from" in tx_params
-        origin = Account(tx_params["from"], tx.chain)
-
-        contracts_by_fqn = get_contracts_by_fqn()
+        origin = Account(tx_params["from"], chain)
 
         if "value" not in tx_params:
             value = 0
@@ -705,23 +1034,21 @@ class CallTrace:
 
         explorer_info = None
         precompiled_info = None
-        if (
-            origin_fqn is None or origin_fqn not in contracts_by_fqn
-        ) and tx.to is not None:
-            if Address(0) < tx.to.address <= Address(9):
+        if (origin_fqn is None or origin_fqn not in all_fqns) and to is not None:
+            if Address(0) < to.address <= Address(9):
                 precompiled_info = get_precompiled_info(
-                    tx.to.address, b"" if "data" not in tx_params else tx_params["data"]
+                    to.address, b"" if "data" not in tx_params else tx_params["data"]
                 )
-            elif tx.chain._fork is not None:
-                explorer_info = get_contract_info_from_explorer(
-                    tx.to.address,
-                    tx.chain._forked_chain_id
-                    if tx.chain._forked_chain_id is not None
-                    else tx.chain.chain_id,
+            elif chain._fork is not None:
+                explorer_info = _get_info_from_explorer(
+                    to.address,
+                    chain._forked_chain_id
+                    if chain._forked_chain_id is not None
+                    else chain.chain_id,
                 )
 
         if (
-            (origin_fqn is None or origin_fqn not in contracts_by_fqn)
+            (origin_fqn is None or origin_fqn not in all_fqns)
             and explorer_info is None
             and precompiled_info is None
         ):
@@ -730,35 +1057,35 @@ class CallTrace:
                 None,
                 None,
                 None,
-                None if tx.to is None else tx.to.address,
+                None if to is None else to.address,
                 [b"" if "data" not in tx_params else tx_params["data"]],
                 [None],
-                gas_limit,
+                tx_params["gas"],
                 value,
                 CallTraceKind.CALL,
                 1,
-                tx.chain,
+                chain,
                 origin,
                 [],
                 {},
                 True,
             )
         elif precompiled_info is not None:
-            assert tx.to is not None
+            assert to is not None
             precompiled_name, args, arg_names = precompiled_info
             root_trace = CallTrace(
                 None,
                 "<precompiled>",
                 precompiled_name,
                 None,
-                tx.to.address,
+                to.address,
                 args,
                 arg_names,
-                gas_limit,
+                tx_params["gas"],
                 value,
                 CallTraceKind.CALL,
                 1,
-                tx.chain,
+                chain,
                 origin,
                 None,
                 {},
@@ -771,13 +1098,9 @@ class CallTrace:
             else:
                 assert origin_fqn is not None
                 contract_name = origin_fqn.split(":")[-1]
-                module_name, attrs = contracts_by_fqn[origin_fqn]
-                obj = getattr(importlib.import_module(module_name), attrs[0])
-                for attr in attrs[1:]:
-                    obj = getattr(obj, attr)
-                contract_abi = obj._abi
+                obj, contract_abi = fqn_to_contract_abi(origin_fqn)
 
-            if tx.to is None:
+            if to is None:
                 if "data" not in tx_params or "constructor" not in contract_abi:
                     args = []
                     arg_names = []
@@ -790,7 +1113,7 @@ class CallTrace:
                         args, arg_names = _decode_args(
                             fn_abi["inputs"],
                             tx_params["data"][constructor_offset:],
-                            tx.chain,
+                            chain,
                         )
                     except Exception:
                         args = None
@@ -800,14 +1123,14 @@ class CallTrace:
                     contract_name,
                     "constructor",
                     None,
-                    tx.return_value.address if tx.status == 1 else None,
+                    created_contract.address if created_contract is not None else None,
                     args,
                     arg_names,
-                    gas_limit,
+                    tx_params["gas"],
                     value,
                     CallTraceKind.CREATE,
                     1,
-                    tx.chain,
+                    chain,
                     origin,
                     [],
                     contract_abi,
@@ -823,14 +1146,14 @@ class CallTrace:
                     contract_name,
                     "receive",
                     None,
-                    tx.to.address,
+                    to.address,
                     [],
                     [],
-                    gas_limit,
+                    tx_params["gas"],
                     value,
                     CallTraceKind.CALL,
                     1,
-                    tx.chain,
+                    chain,
                     origin,
                     [],
                     contract_abi,
@@ -850,14 +1173,14 @@ class CallTrace:
                         contract_name,
                         "fallback",
                         None,
-                        tx.to.address,
+                        to.address,
                         [b"" if "data" not in tx_params else tx_params["data"]],
                         [None],
-                        gas_limit,
+                        tx_params["gas"],
                         value,
                         CallTraceKind.CALL,
                         1,
-                        tx.chain,
+                        chain,
                         origin,
                         [],
                         contract_abi,
@@ -869,14 +1192,14 @@ class CallTrace:
                         contract_name,
                         None,
                         None,
-                        tx.to.address,
+                        to.address,
                         [b"" if "data" not in tx_params else tx_params["data"]],
                         [None],
-                        gas_limit,
+                        tx_params["gas"],
                         value,
                         CallTraceKind.CALL,
                         1,
-                        tx.chain,
+                        chain,
                         origin,
                         [],
                         contract_abi,
@@ -886,7 +1209,7 @@ class CallTrace:
                 fn_abi = contract_abi[tx_params["data"][:4]]
                 try:
                     args, arg_names = _decode_args(
-                        fn_abi["inputs"], tx_params["data"][4:], tx.chain
+                        fn_abi["inputs"], tx_params["data"][4:], chain
                     )
                 except Exception:
                     args = None
@@ -896,14 +1219,14 @@ class CallTrace:
                     contract_name,
                     fn_abi["name"],
                     tx_params["data"][:4],
-                    tx.to.address,
+                    to.address,
                     args,
                     arg_names,
-                    gas_limit,
+                    tx_params["gas"],
                     value,
                     CallTraceKind.CALL,
                     1,
-                    tx.chain,
+                    chain,
                     origin,
                     fn_abi["outputs"] if "outputs" in fn_abi else [],
                     contract_abi,
@@ -937,7 +1260,7 @@ class CallTrace:
                     try:
                         if current_trace._output_abi is not None:
                             return_value, return_names = _decode_args(
-                                current_trace._output_abi, data, tx.chain
+                                current_trace._output_abi, data, chain
                             )
                         else:
                             return_value, return_names = _decode_precompiled(
@@ -952,6 +1275,10 @@ class CallTrace:
                         return_names  # pyright: ignore reportAttributeAccessIssue
                     )
                     current_trace._status = status
+                    if current_trace._parent is not None:
+                        current_trace._parent._all_events.extend(
+                            current_trace._all_events
+                        )
 
                     current_trace = current_trace._parent
                     fqn_overrides.maps[1].update(fqn_overrides.maps[0])
@@ -973,6 +1300,7 @@ class CallTrace:
                         fqn_overrides.maps.pop(0)
 
                         current_trace._status = False
+                        current_trace._all_events.clear()
                         current_trace = current_trace._parent
                         assert current_trace is not None
                         contracts.pop()
@@ -1003,7 +1331,7 @@ class CallTrace:
                 if addr in fqn_overrides:
                     fqn = fqn_overrides[addr]
                 else:
-                    fqn = get_fqn_from_address(addr, tx.block.number - 1, tx.chain)
+                    fqn = get_fqn_from_address(addr, fqn_block_number, chain)
 
                 explorer_info = None
                 precompiled_info = None
@@ -1012,12 +1340,12 @@ class CallTrace:
                 ):
                     if Address(0) < addr <= Address(9):
                         precompiled_info = get_precompiled_info(addr, data)
-                    elif tx.chain._fork is not None:
-                        explorer_info = get_contract_info_from_explorer(
+                    elif chain._fork is not None:
+                        explorer_info = _get_info_from_explorer(
                             addr,
-                            tx.chain._forked_chain_id
-                            if tx.chain._forked_chain_id is not None
-                            else tx.chain.chain_id,
+                            chain._forked_chain_id
+                            if chain._forked_chain_id is not None
+                            else chain.chain_id,
                         )
 
                 if fqn is None and explorer_info is None and precompiled_info is None:
@@ -1025,9 +1353,7 @@ class CallTrace:
                         if data[:4] in hardhat_console.abis:
                             fn_abi = hardhat_console.abis[data[:4]]
                             try:
-                                args, arg_names = _decode_args(
-                                    fn_abi, data[4:], tx.chain
-                                )
+                                args, arg_names = _decode_args(fn_abi, data[4:], chain)
                             except Exception:
                                 args = None
                                 arg_names = None
@@ -1047,7 +1373,7 @@ class CallTrace:
                             value,
                             log["op"],
                             current_trace.depth + 1,
-                            tx.chain,
+                            chain,
                             origin,
                             [],
                             {},
@@ -1065,7 +1391,7 @@ class CallTrace:
                             value,
                             log["op"],
                             current_trace.depth + 1,
-                            tx.chain,
+                            chain,
                             origin,
                             [],
                             {},
@@ -1084,7 +1410,7 @@ class CallTrace:
                         value,
                         log["op"],
                         current_trace.depth + 1,
-                        tx.chain,
+                        chain,
                         origin,
                         None,
                         {},
@@ -1097,11 +1423,7 @@ class CallTrace:
                     else:
                         assert fqn is not None
                         contract_name = fqn.split(":")[-1]
-                        module_name, attrs = contracts_by_fqn[fqn]
-                        obj = getattr(importlib.import_module(module_name), attrs[0])
-                        for attr in attrs[1:]:
-                            obj = getattr(obj, attr)
-                        contract_abi = obj._abi
+                        obj, contract_abi = fqn_to_contract_abi(fqn)
 
                     if args_size >= 4:
                         selector = data[:4]
@@ -1109,7 +1431,7 @@ class CallTrace:
                             fn_abi = contract_abi[selector]
                             try:
                                 args, arg_names = _decode_args(
-                                    fn_abi["inputs"], data[4:], tx.chain
+                                    fn_abi["inputs"], data[4:], chain
                                 )
                             except Exception:
                                 args = None
@@ -1170,7 +1492,7 @@ class CallTrace:
                         value,
                         log["op"],
                         current_trace.depth + 1,
-                        tx.chain,
+                        chain,
                         origin,
                         None if precompiled_info is not None else output_abi,
                         contract_abi,
@@ -1199,6 +1521,7 @@ class CallTrace:
                     current_trace._error_name = "UnknownTransactionRevertedError"
                     current_trace._error_arguments = [b""]
                     current_trace._error_names = [None]
+                    current_trace._all_events.clear()
                 elif log["op"] == "RETURN":
                     data_offset = int(log["stack"][-1], 16)
                     data_size = int(log["stack"][-2], 16)
@@ -1209,7 +1532,7 @@ class CallTrace:
                     try:
                         if current_trace._output_abi is not None:
                             return_value, return_names = _decode_args(
-                                current_trace._output_abi, data, tx.chain
+                                current_trace._output_abi, data, chain
                             )
                         else:
                             return_value, return_names = _decode_precompiled(
@@ -1223,6 +1546,10 @@ class CallTrace:
                     current_trace._return_names = (
                         return_names  # pyright: ignore reportAttributeAccessIssue
                     )
+                    if current_trace._parent is not None:
+                        current_trace._parent._all_events.extend(
+                            current_trace._all_events
+                        )
                 elif log["op"] == "REVERT":
                     data_offset = int(log["stack"][-1], 16)
                     data_size = int(log["stack"][-2], 16)
@@ -1230,6 +1557,7 @@ class CallTrace:
                         read_from_memory(data_offset, data_size, log["memory"])
                     )
                     current_trace._revert_data = data
+                    current_trace._all_events.clear()
 
                     if any(t._revert_data == data for t in current_trace._subtraces):
                         # error propagated from a subtrace
@@ -1250,7 +1578,7 @@ class CallTrace:
                             error_args, error_names = _decode_args(
                                 current_trace._abi[data[:4]]["inputs"],
                                 data[4:],
-                                tx.chain,
+                                chain,
                             )
                             current_trace._error_name = current_trace._abi[data[:4]][
                                 "name"
@@ -1269,12 +1597,12 @@ class CallTrace:
                             )
                             current_trace._error_arguments = [data]
                             current_trace._error_names = [None]
-                else:
+                else:  # STOP, SELFDESTRUCT
                     if current_trace._output_abi is not None:
                         try:
                             # just use a large enough zeroed buffer instead of evaluating the exact size
                             return_value, return_names = _decode_args(
-                                current_trace._output_abi, b"\x00" * 100_000, tx.chain
+                                current_trace._output_abi, b"\x00" * 100_000, chain
                             )
                         except Exception:
                             return_value = None
@@ -1284,6 +1612,10 @@ class CallTrace:
                         return_value, return_names = [], []
                     current_trace._return_value = return_value
                     current_trace._return_names = return_names
+                    if current_trace._parent is not None:
+                        current_trace._parent._all_events.extend(
+                            current_trace._all_events
+                        )
 
                 assert current_trace is not None
                 if (
@@ -1321,11 +1653,7 @@ class CallTrace:
                     fqn, constructor_offset = get_fqn_from_creation_code(creation_code)
 
                     contract_name = fqn.split(":")[-1]
-                    module_name, attrs = contracts_by_fqn[fqn]
-                    obj = getattr(importlib.import_module(module_name), attrs[0])
-                    for attr in attrs[1:]:
-                        obj = getattr(obj, attr)
-                    contract_abi = obj._abi
+                    obj, contract_abi = fqn_to_contract_abi(fqn)
 
                     if "constructor" not in contract_abi:
                         args = []
@@ -1336,7 +1664,7 @@ class CallTrace:
                             args, arg_names = _decode_args(
                                 fn_abi["inputs"],
                                 creation_code[constructor_offset:],
-                                tx.chain,
+                                chain,
                             )
                         except Exception:
                             args = None
@@ -1361,7 +1689,7 @@ class CallTrace:
                     value,
                     log["op"],
                     current_trace.depth + 1,
-                    tx.chain,
+                    chain,
                     origin,
                     [],
                     contract_abi,
@@ -1374,5 +1702,49 @@ class CallTrace:
                 contracts.append(fqn)
                 values.append(value)
                 fqn_overrides.maps.insert(0, {})
+            elif log["op"] == "LOG0":
+                assert current_trace is not None
+                data_offset = int(log["stack"][-1], 16)
+                data_size = int(log["stack"][-2], 16)
+                data = bytes(read_from_memory(data_offset, data_size, log["memory"]))
+                event = CallTraceEvent(
+                    name="UnknownEvent",
+                    args=[data],
+                    arg_names=["data"],
+                )
+                current_trace._events.append(event)
+                current_trace._all_events.append(event)
+            elif log["op"] in {"LOG1", "LOG2", "LOG3", "LOG4"}:
+                assert current_trace is not None
+                data_offset = int(log["stack"][-1], 16)
+                data_size = int(log["stack"][-2], 16)
+                topics_count = int(log["op"][3:])
+                topics = [
+                    bytes.fromhex(log["stack"][-3 - i][2:].zfill(64))
+                    for i in range(topics_count)
+                ]
+                data = bytes(read_from_memory(data_offset, data_size, log["memory"]))
+                try:
+                    event_args, event_names = _decode_event_args(
+                        current_trace._abi[topics[0]]["inputs"],
+                        topics[1:],
+                        data,
+                        chain,
+                    )
+                    event = CallTraceEvent(
+                        name=current_trace._abi[topics[0]]["name"],
+                        args=event_args,
+                        arg_names=event_names,
+                    )
+                    current_trace._events.append(event)
+                    current_trace._all_events.append(event)
+                except Exception as ex:
+                    event = CallTraceEvent(
+                        name="UnknownEvent",
+                        args=topics + [data],
+                        arg_names=[f"topic{i}" for i in range(topics_count)] + ["data"],
+                    )
+                    current_trace._events.append(event)
+                    current_trace._all_events.append(event)
 
         return root_trace

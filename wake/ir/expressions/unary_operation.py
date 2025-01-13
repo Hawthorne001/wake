@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
 
@@ -10,6 +11,7 @@ from wake.ir.enums import ModifiesStateFlag, UnaryOpOperator
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.reference_resolver import CallbackParams
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..statements.abc import StatementAbc
@@ -25,7 +27,7 @@ class UnaryOperation(ExpressionAbc):
     """
 
     _ast_node: SolcUnaryOperation
-    _parent: SolidityAbc
+    _parent: weakref.ReferenceType[SolidityAbc]
 
     _operator: UnaryOpOperator
     _prefix: bool
@@ -65,7 +67,15 @@ class UnaryOperation(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._sub_expression
 
     @property
     def operator(self) -> UnaryOpOperator:
@@ -96,7 +106,7 @@ class UnaryOperation(ExpressionAbc):
         return False
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

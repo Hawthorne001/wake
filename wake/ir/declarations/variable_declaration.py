@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import weakref
 from bisect import bisect
 from collections import deque
 from functools import lru_cache, partial
@@ -27,9 +28,11 @@ from wake.ir.meta.structured_documentation import StructuredDocumentation
 from wake.ir.type_names.abc import TypeNameAbc
 from wake.ir.types import TypeAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 from wake.utils.string import StringReader
 
 from ...regex_parser import SoliditySourceParser
+from ..abc import is_not_none
 from ..meta.override_specifier import OverrideSpecifier
 from ..reference_resolver import CallbackParams
 
@@ -124,12 +127,14 @@ class VariableDeclaration(DeclarationAbc):
     """
 
     _ast_node: SolcVariableDeclaration
-    _parent: Union[
-        ContractDefinition,
-        ParameterList,
-        SourceUnit,
-        StructDefinition,
-        VariableDeclarationStatement,
+    _parent: weakref.ReferenceType[
+        Union[
+            ContractDefinition,
+            ParameterList,
+            SourceUnit,
+            StructDefinition,
+            VariableDeclarationStatement,
+        ]
     ]
 
     _constant: bool
@@ -211,14 +216,15 @@ class VariableDeclaration(DeclarationAbc):
     def _post_process(self, callback_params: CallbackParams):
         base_functions = self.base_functions
         for base_function in base_functions:
-            base_function._child_functions.add(self)
+            base_function._child_functions.add(weakref.ref(self))
         self._reference_resolver.register_destroy_callback(
             self.source_unit.file, partial(self._destroy, base_functions)
         )
 
     def _destroy(self, base_functions: Tuple[FunctionDefinition, ...]) -> None:
         for base_function in base_functions:
-            base_function._child_functions.discard(self)
+            ref = next(f for f in base_function._child_functions if f() is self)
+            base_function._child_functions.discard(ref)
 
     def _parse_name_location(self) -> Tuple[int, int]:
         # this one is a bit tricky
@@ -238,6 +244,10 @@ class VariableDeclaration(DeclarationAbc):
             )
         )
         match = VARIABLE_RE.search(source_without_value)
+        if not match:
+            # the variable has no name
+            byte_end = self._ast_node.src.byte_offset + len(source_without_value)
+            return byte_end, byte_end
         assert match
         byte_start = self._ast_node.src.byte_offset
 
@@ -308,10 +318,28 @@ class VariableDeclaration(DeclarationAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
 
     @property
-    @lru_cache(maxsize=2048)
+    def children(
+        self,
+    ) -> Iterator[
+        Union[StructuredDocumentation, OverrideSpecifier, TypeNameAbc, ExpressionAbc]
+    ]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        if self._documentation is not None:
+            yield self._documentation
+        if self._overrides is not None:
+            yield self._overrides
+        yield self._type_name
+        if self._value is not None:
+            yield self._value
+
+    @property
+    @weak_self_lru_cache(maxsize=2048)
     def canonical_name(self) -> str:
         node = self.parent
         while node is not None:
@@ -323,7 +351,7 @@ class VariableDeclaration(DeclarationAbc):
         return f"{node.canonical_name}.{self.name}"
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def declaration_string(self) -> str:
         ret = self.type_name.source
         ret += f" {self.visibility}" if self.is_state_variable else ""
@@ -529,7 +557,7 @@ class VariableDeclaration(DeclarationAbc):
         return self._value
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def type(self) -> TypeAbc:
         """
         Returns:
@@ -572,14 +600,14 @@ class VariableDeclaration(DeclarationAbc):
         from ..expressions.member_access import MemberAccess
         from ..statements.inline_assembly import ExternalReference
 
+        refs = [is_not_none(r()) for r in self._references]
+
         try:
             ref = next(
                 ref
-                for ref in self._references
+                for ref in refs
                 if not isinstance(ref, (Identifier, MemberAccess, ExternalReference))
             )
             raise AssertionError(f"Unexpected reference type: {ref}")
         except StopIteration:
-            return frozenset(
-                self._references
-            )  # pyright: ignore reportGeneralTypeIssues
+            return frozenset(refs)  # pyright: ignore reportGeneralTypeIssues
