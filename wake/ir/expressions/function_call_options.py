@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache, reduce
 from operator import or_
 from typing import TYPE_CHECKING, Iterator, List, Set, Tuple, Union
@@ -9,6 +10,7 @@ from wake.ir.ast import SolcFunctionCallOptions
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..statements.abc import StatementAbc
@@ -31,7 +33,7 @@ class FunctionCallOptions(ExpressionAbc):
     """
 
     _ast_node: SolcFunctionCallOptions
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _expression: ExpressionAbc
     _names: List[str]
@@ -61,7 +63,16 @@ class FunctionCallOptions(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._expression
+        yield from self._options
 
     @property
     def expression(self) -> ExpressionAbc:
@@ -102,7 +113,7 @@ class FunctionCallOptions(ExpressionAbc):
         return False
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

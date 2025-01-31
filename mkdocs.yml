@@ -43,6 +43,7 @@ nav:
       - Installation: 'installation.md'
       - Configuration: 'configuration.md'
       - Compilation: 'compilation.md'
+      - Changelog: 'changelog.md'
       - Contributing: 'contributing.md'
   - Development and testing framework:
       - Overview: 'testing-framework/overview.md'
@@ -97,6 +98,13 @@ nav:
             - Imports graph: 'static-analysis/printers/imports-graph.md'
             - Inheritance graph: 'static-analysis/printers/inheritance-graph.md'
             - Inheritance tree: 'static-analysis/printers/inheritance-tree.md'
+            - LSP control flow graph: 'static-analysis/printers/lsp-control-flow-graph.md'
+            - LSP inheritance graph: 'static-analysis/printers/lsp-inheritance-graph.md'
+            - LSP linearized inheritance graph: 'static-analysis/printers/lsp-linearized-inheritance-graph.md'
+            - LSP OpenZeppelin docs: 'static-analysis/printers/lsp-openzeppelin-docs.md'
+            - LSP references: 'static-analysis/printers/lsp-references.md'
+            - LSP selectors: 'static-analysis/printers/lsp-selectors.md'
+            - LSP Yul definitions: 'static-analysis/printers/lsp-yul-definitions.md'
             - Modifiers: 'static-analysis/printers/modifiers.md'
             - State changes: 'static-analysis/printers/state-changes.md'
             - Storage layout: 'static-analysis/printers/storage-layout.md'
@@ -212,6 +220,42 @@ nav:
               - variable_declaration: 'api-reference/ir/yul/variable-declaration.md'
       - wake.printers:
           - api: 'api-reference/printers/api.md'
+  - Cookbook:
+    - 'cookbook/index.md'
+    - Essential Fundamentals:
+      - 'cookbook/essential-fundamentals/index.md'
+      - Basic Fuzz Test Structure: 'cookbook/essential-fundamentals/basic-fuzz-test-structure.md'
+      - Config File Schema: 'cookbook/essential-fundamentals/config-file-schema.md'
+      - Error Handling: 'cookbook/essential-fundamentals/error-handling.md'
+      - Flows: 'cookbook/essential-fundamentals/flows.md'
+    - Common Testing Patterns:
+      - 'cookbook/common-testing-patterns/index.md'
+      - Account Balance Testing: 'cookbook/common-testing-patterns/account-balance-testing.md'
+      - Multi Token Interaction: 'cookbook/common-testing-patterns/multi-token-interaction.md'
+      - State Change Tracking: 'cookbook/common-testing-patterns/state-change-tracking.md'
+      - Test Flow Branching: 'cookbook/common-testing-patterns/test-flow-branching.md'
+    - Advanced Testing Features:
+      - 'cookbook/advanced-testing-features/index.md'
+      - Context Based Balance Tracking Pattern: 'cookbook/advanced-testing-features/context-based-balance-tracking-pattern.md'
+      - Differential Testing: 'cookbook/advanced-testing-features/differential-testing.md'
+      - Error Tolerance: 'cookbook/advanced-testing-features/error-tolerance.md'
+      - Time Based Testing: 'cookbook/advanced-testing-features/time-based-testing.md'
+      - Token Allowances with Multiple Branches: 'cookbook/advanced-testing-features/token-allowances-with-multiple-branches.md'
+    - Specialized Use Cases:
+      - 'cookbook/specialized-use-cases/index.md'
+      - Address Bytes Conversion with Random Data: 'cookbook/specialized-use-cases/address-bytes-conversion-with-random-data.md'
+      - Chainlink Data Updating: 'cookbook/specialized-use-cases/chainlink-data-updating.md'
+      - Cross Chain Message Passing: 'cookbook/specialized-use-cases/cross-chain-message-passing.md'
+      - Deploy with Proxy: 'cookbook/specialized-use-cases/deploy-with-proxy.md'
+      - Multi Chain Token Deployments: 'cookbook/specialized-use-cases/multi-chain-token-deployments.md'
+      - Multi Token Accounting: 'cookbook/specialized-use-cases/multi-token-accounting.md'
+      - Permit Functions with EIP712 Signatures: 'cookbook/specialized-use-cases/permit-functions-with-eip712-signatures.md'
+    - Testing Infrastructure:
+      - 'cookbook/testing-infrastructure/index.md'
+      - Initialization Strategies: 'cookbook/testing-infrastructure/initialization-strategies.md'
+      - Logging with Formatting: 'cookbook/testing-infrastructure/logging-with-formatting.md'
+      - Post Sequence Cleanup: 'cookbook/testing-infrastructure/post-sequence-cleanup.md'
+      - Results Collection: 'cookbook/testing-infrastructure/results-collection.md'
 
 extra:
   generator: false
@@ -220,10 +264,8 @@ extra:
       link: https://github.com/Ackee-Blockchain/wake
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/WakeFramework
-    - icon: fontawesome/brands/telegram
-      link: https://t.me/wakeframework
-    - icon: fontawesome/brands/telegram
-      link: https://t.me/wake_group
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/YE9hntHvAe
   version:
     provider: mike
   analytics:
@@ -253,6 +295,7 @@ plugins:
       color: "#FFFFFF"
 
 markdown_extensions:
+  - attr_list
   - def_list
   - admonition
   - toc:

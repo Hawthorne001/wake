@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import weakref
 from bisect import bisect
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
@@ -30,6 +31,7 @@ from wake.ir.types import (
     UserDefinedValueType,
 )
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 from ...regex_parser import SoliditySourceParser
 
@@ -49,7 +51,7 @@ class MemberAccess(ExpressionAbc):
     """
 
     _ast_node: SolcMemberAccess
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _expression: ExpressionAbc
     _member_name: str
@@ -385,7 +387,15 @@ class MemberAccess(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return self._parent()
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._expression
 
     @property
     def expression(self) -> ExpressionAbc:
@@ -404,7 +414,7 @@ class MemberAccess(ExpressionAbc):
         return self._member_name
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def member_location(self) -> Tuple[int, int]:
         """
         In the case of [MemberAccess][wake.ir.expressions.member_access.MemberAccess], [byte_location][wake.ir.abc.IrAbc.byte_location] returns the byte location including the expression, whose member is accessed.
@@ -455,7 +465,7 @@ class MemberAccess(ExpressionAbc):
         return node
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def is_ref_to_state_variable(self) -> bool:
         referenced_declaration = self.referenced_declaration
         return (
@@ -465,7 +475,7 @@ class MemberAccess(ExpressionAbc):
         )
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

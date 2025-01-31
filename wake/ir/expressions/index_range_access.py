@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
 
@@ -8,6 +9,7 @@ from wake.ir.ast import SolcIndexRangeAccess
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..statements.abc import StatementAbc
@@ -29,7 +31,7 @@ class IndexRangeAccess(ExpressionAbc):
     """
 
     _ast_node: SolcIndexRangeAccess
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _base_expression: ExpressionAbc
     _start_expression: Optional[ExpressionAbc]
@@ -70,7 +72,19 @@ class IndexRangeAccess(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._base_expression
+        if self._start_expression is not None:
+            yield self._start_expression
+        if self._end_expression is not None:
+            yield self._end_expression
 
     @property
     def base_expression(self) -> ExpressionAbc:
@@ -106,7 +120,7 @@ class IndexRangeAccess(ExpressionAbc):
         return False
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

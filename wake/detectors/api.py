@@ -34,6 +34,8 @@ from wake.utils.file_utils import is_relative_to
 from wake.utils.keyed_default_dict import KeyedDefaultDict
 
 if TYPE_CHECKING:
+    import threading
+
     import networkx as nx
     import rich.console
     from rich.syntax import SyntaxTheme
@@ -214,13 +216,11 @@ def _strip_excluded_subdetections(
     if len(detection.subdetections) == 0:
         return detection
 
-    wake_contracts_path = Path(__file__).parent.parent / "contracts"
-
     subdetections = []
     for d in detection.subdetections:
         if not any(
             is_relative_to(d.ir_node.source_unit.file, p)
-            for p in chain(config.detectors.exclude_paths, [wake_contracts_path])
+            for p in chain(config.detectors.exclude_paths, [config.wake_contracts_path])
         ):
             subdetections.append(d)
             continue
@@ -323,11 +323,9 @@ def _filter_detections(
         ):
             continue
 
-        wake_contracts_path = Path(__file__).parent.parent / "contracts"
-
         if any(
             is_relative_to(detection.detection.ir_node.source_unit.file, p)
-            for p in chain(config.detectors.exclude_paths, [wake_contracts_path])
+            for p in chain(config.detectors.exclude_paths, [config.wake_contracts_path])
         ):
             detection = DetectorResult(
                 _strip_excluded_subdetections(detection.detection, config),
@@ -368,6 +366,7 @@ def detect(
     capture_exceptions: bool = False,
     logging_handler: Optional[logging.Handler] = None,
     extra: Optional[Dict[Any, Any]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[
     List[click.Command],
     Dict[str, Tuple[List[DetectorResult], List[DetectorResult]]],
@@ -375,6 +374,7 @@ def detect(
 ]:
     from contextlib import nullcontext
 
+    from wake.core.exceptions import ThreadCancelledError
     from wake.utils import get_package_version
 
     if extra is None:
@@ -454,8 +454,14 @@ def detect(
     )
 
     for command in list(detectors):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ThreadCancelledError()
+
         assert command is not None
         assert command.name is not None
+
+        if lsp_provider is not None:
+            lsp_provider._current_sort_tag = command.name
 
         if hasattr(config.detector, command.name):
             default_map = getattr(config.detector, command.name)
@@ -624,6 +630,9 @@ def detect(
     )
     with ctx_manager as status:
         for path, source_unit in build.source_units.items():
+            if cancel_event is not None and cancel_event.is_set():
+                raise ThreadCancelledError()
+
             if any(is_relative_to(path, p) for p in config.detectors.ignore_paths):
                 continue
 
@@ -640,6 +649,9 @@ def detect(
 
             for node in source_unit:
                 for detector_name in list(target_detectors):
+                    if lsp_provider is not None:
+                        lsp_provider._current_sort_tag = detector_name
+
                     detector = collected_detectors[detector_name]
                     try:
                         detector.visit_ir_abc(node)
@@ -656,6 +668,12 @@ def detect(
                         del collected_detectors[detector_name]
 
     for detector_name, detector in collected_detectors.items():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ThreadCancelledError()
+
+        if lsp_provider is not None:
+            lsp_provider._current_sort_tag = detector_name
+
         try:
             detections[detector_name] = _filter_detections(
                 detector_name,
@@ -683,6 +701,8 @@ def print_detection(
     config: WakeConfig,
     console: rich.console.Console,
     theme: Union[str, SyntaxTheme] = "monokai",
+    *,
+    file_link: bool = True,
 ) -> None:
     from rich.panel import Panel
     from rich.syntax import Syntax
@@ -706,7 +726,7 @@ def print_detection(
         line -= 1
         source = ""
         start_line_index = max(0, line - 3)
-        end_line_index = min(len(source_unit._lines_index), line + 3)
+        end_line_index = min(len(source_unit._lines_index), line + 4)
         for i in range(start_line_index, end_line_index):
             source += source_unit._lines_index[i][0].decode("utf-8")
 
@@ -715,7 +735,10 @@ def print_detection(
             line=line + 1,
             col=col,
         )
-        subtitle = f"[link={link}]{source_unit.source_unit_name}[/link]"
+        if file_link:
+            subtitle = f"[link={link}]{source_unit.source_unit_name}[/link]"
+        else:
+            subtitle = source_unit.source_unit_name
 
         title = ""
         if isinstance(info, DetectorResult):
@@ -747,7 +770,7 @@ def print_detection(
 
         panel = Panel.fit(
             Syntax(
-                source,
+                source.rstrip(),
                 "solidity",
                 theme=theme,
                 line_numbers=True,

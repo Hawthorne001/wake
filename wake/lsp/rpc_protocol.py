@@ -55,16 +55,22 @@ class RpcProtocol:
 
         if "id" in raw_message:
             if "method" in raw_message:
-                return RequestMessage.parse_obj(raw_message)
+                return RequestMessage.model_validate(raw_message)
             else:
-                return ResponseMessage.parse_obj(raw_message)
-        return NotificationMessage.parse_obj(raw_message)
+                return ResponseMessage.model_validate(raw_message)
+        return NotificationMessage.model_validate(raw_message)
 
     async def _send(self, message: str) -> None:
-        content_length = len(message)
-        response = f"Content-Length: {content_length}\r\nContent-Type: application/vscode-jsonrpc; charset={ENCODING}\r\n\r\n{message}"
+        encoded_message = message.encode(ENCODING)
+        content_length = len(encoded_message)
+        response = (
+            f"Content-Length: {content_length}\r\nContent-Type: application/vscode-jsonrpc; charset={ENCODING}\r\n\r\n".encode(
+                ENCODING
+            )
+            + encoded_message
+        )
         async with self.__lock:
-            self.__writer.write(response.encode(ENCODING))
+            self.__writer.write(response)
             await self.__writer.drain()
 
     async def send(
@@ -73,4 +79,4 @@ class RpcProtocol:
             ResponseMessage, RequestMessage, ResponseError, NotificationMessage
         ],
     ) -> None:
-        await self._send(message.json(exclude_unset=True, by_alias=True))
+        await self._send(message.model_dump_json(exclude_unset=True, by_alias=True))

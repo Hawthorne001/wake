@@ -75,7 +75,7 @@ async def open_address(
     import urllib.request
 
     import tomli_w
-    from pydantic import ValidationError, parse_raw_as
+    from pydantic import TypeAdapter, ValidationError
 
     from wake.compiler.solc_frontend import SolcInput, SolcInputSource
     from wake.config import WakeConfig
@@ -97,10 +97,15 @@ async def open_address(
         project_dir = (
             config.global_cache_path / "explorers" / str(chain_id) / address.lower()
         )
+
+    link = config.general.link_format.format(
+        path=str(project_dir),
+        line=0,
+        col=0,
+    )
+
     if project_dir.exists() and not force:
-        console.print(
-            f"{address} already exists at [link=vscode://file/{project_dir}]{project_dir}[/link]"
-        )
+        console.print(f"{address} already exists at [link={link}]{project_dir}[/link]")
         return
 
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -143,12 +148,12 @@ async def open_address(
 
     code = parsed["result"][0]["SourceCode"]
     try:
-        standard_input: SolcInput = SolcInput.parse_raw(code[1:-1])
+        standard_input: SolcInput = SolcInput.model_validate_json(code[1:-1])
         if any(
             PurePosixPath(filename).is_absolute()
             for filename in standard_input.sources.keys()
         ):
-            raise ValueError("Absolute paths are not supported")
+            raise NotImplementedError("Absolute paths are not supported")
         if standard_input.settings is not None:
             if standard_input.settings.evm_version is not None:
                 project_config_raw["compiler"]["solc"]["evm_version"] = str(
@@ -179,9 +184,10 @@ async def open_address(
         }
     except ValidationError as e:
         try:
-            s = parse_raw_as(Dict[str, SolcInputSource], code)
+            a = TypeAdapter(Dict[str, SolcInputSource])
+            s = a.validate_json(code)
             if any(PurePosixPath(filename).is_absolute() for filename in s.keys()):
-                raise ValueError("Absolute paths are not supported")
+                raise NotImplementedError("Absolute paths are not supported")
 
             sources = {project_dir / path: source.content for path, source in s.items()}
         except (ValidationError, json.JSONDecodeError) as e:
@@ -196,9 +202,7 @@ async def open_address(
 
     project_dir.joinpath("wake.toml").write_text(tomli_w.dumps(project_config_raw))
 
-    console.print(
-        f"Opened {address} at [link=vscode://file/{project_dir}]{project_dir}[/link]"
-    )
+    console.print(f"Opened {address} at [link={link}]{project_dir}[/link]")
 
 
 def open_github(
@@ -234,12 +238,19 @@ def open_github(
 
     if project_dir is None:
         project_dir = config.global_cache_path / "github" / owner / repo
+
+    link = config.general.link_format.format(
+        path=str(project_dir),
+        line=0,
+        col=0,
+    )
+
     if project_dir.exists():
         if force:
             shutil.rmtree(project_dir)
         else:
             console.print(
-                f"{owner}/{repo} already exists at [link=vscode://file/{project_dir}]{project_dir}[/link]"
+                f"{owner}/{repo} already exists at [link={link}]{project_dir}[/link]"
             )
             return
 
@@ -253,6 +264,4 @@ def open_github(
             cwd=project_dir.parent,
         )
 
-    console.print(
-        f"Opened {owner}/{repo} at [link=vscode://file/{project_dir}]{project_dir}[/link]"
-    )
+    console.print(f"Opened {owner}/{repo} at [link={link}]{project_dir}[/link]")

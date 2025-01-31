@@ -99,12 +99,21 @@ def update_gitignore(file: Path) -> None:
     "--force", "-f", is_flag=True, default=False, help="Force overwrite existing files."
 )
 @click.option(
+    "--incremental/--no-incremental",
+    is_flag=True,
+    required=False,
+    default=None,
+    help="Enforce incremental or non-incremental compilation.",
+)
+@click.option(
     "--example",
     type=click.Choice(["counter"], case_sensitive=False),
     help="Initialize example project.",
 )
 @click.pass_context
-def run_init(ctx: Context, force: bool, example: Optional[str]):
+def run_init(
+    ctx: Context, force: bool, incremental: Optional[bool], example: Optional[str]
+):
     """Initialize project."""
     from wake.config import WakeConfig
 
@@ -115,6 +124,7 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
     if ctx.invoked_subcommand is not None:
         return
 
+    import glob
     import subprocess
 
     from ..compiler import SolcOutputSelectionEnum, SolidityCompiler
@@ -165,7 +175,8 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
     sol_files: Set[Path] = set()
     start = time.perf_counter()
     with console.status("[bold green]Searching for *.sol files...[/]"):
-        for file in config.project_root_path.rglob("**/*.sol"):
+        for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+            file = Path(f)
             if (
                 not any(
                     is_relative_to(file, p) for p in config.compiler.solc.exclude_paths
@@ -173,6 +184,8 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
                 and file.is_file()
             ):
                 sol_files.add(file)
+        for file in Path(config.wake_contracts_path).rglob("**/*.sol"):
+            sol_files.add(file)
     end = time.perf_counter()
     console.log(
         f"[green]Found {len(sol_files)} *.sol files in [bold green]{end - start:.2f} s[/bold green][/]"
@@ -192,6 +205,7 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
                 force_recompile=False,
                 console=console,
                 no_warnings=True,
+                incremental=incremental,
             )
         )
 
@@ -227,6 +241,7 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
                     force_recompile=False,
                     console=console,
                     no_warnings=True,
+                    incremental=incremental,
                 )
             )
             stack_too_deep = any(
@@ -250,6 +265,7 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
                         force_recompile=False,
                         console=console,
                         no_warnings=True,
+                        incremental=incremental,
                     )
                 )
         start = time.perf_counter()
@@ -264,8 +280,14 @@ def run_init(ctx: Context, force: bool, example: Optional[str]):
 
 
 async def run_init_pytypes(
-    config: WakeConfig, return_tx: bool, warnings: bool, watch: bool
+    config: WakeConfig,
+    return_tx: bool,
+    warnings: bool,
+    watch: bool,
+    incremental: Optional[bool],
 ):
+    import glob
+
     from watchdog.observers import Observer
 
     from ..compiler import SolcOutputSelectionEnum, SolidityCompiler
@@ -288,7 +310,8 @@ async def run_init_pytypes(
     sol_files: Set[Path] = set()
     start = time.perf_counter()
     with console.status("[bold green]Searching for *.sol files...[/]"):
-        for file in config.project_root_path.rglob("**/*.sol"):
+        for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+            file = Path(f)
             if (
                 not any(
                     is_relative_to(file, p) for p in config.compiler.solc.exclude_paths
@@ -296,6 +319,8 @@ async def run_init_pytypes(
                 and file.is_file()
             ):
                 sol_files.add(file)
+        for file in Path(config.wake_contracts_path).rglob("**/*.sol"):
+            sol_files.add(file)
     end = time.perf_counter()
     console.log(
         f"[green]Found {len(sol_files)} *.sol files in [bold green]{end - start:.2f} s[/bold green][/]"
@@ -334,6 +359,7 @@ async def run_init_pytypes(
         force_recompile=False,
         console=console,
         no_warnings=not warnings,
+        incremental=incremental,
     )
 
     start = time.perf_counter()
@@ -379,6 +405,13 @@ async def run_init_pytypes(
     is_flag=True,
     default=False,
     help="Watch for changes in the project and regenerate pytypes on change.",
+)
+@click.option(
+    "--incremental/--no-incremental",
+    is_flag=True,
+    required=False,
+    default=None,
+    help="Enforce incremental or non-incremental compilation.",
 )
 @click.option(
     "--allow-path",
@@ -463,6 +496,7 @@ def init_pytypes(
     return_tx: bool,
     warnings: bool,
     watch: bool,
+    incremental: Optional[bool],
     allow_paths: Tuple[str],
     evm_version: Optional[str],
     exclude_paths: Tuple[str],
@@ -510,7 +544,7 @@ def init_pytypes(
 
     config.update({"compiler": {"solc": new_options}}, deleted_options)
 
-    asyncio.run(run_init_pytypes(config, return_tx, warnings, watch))
+    asyncio.run(run_init_pytypes(config, return_tx, warnings, watch, incremental))
 
 
 @run_init.command(name="config")
@@ -521,9 +555,17 @@ def init_pytypes(
     default=False,
     help="Force overwrite existing config file.",
 )
+@click.option(
+    "--incremental/--no-incremental",
+    is_flag=True,
+    required=False,
+    default=None,
+    help="Enforce incremental or non-incremental compilation.",
+)
 @click.pass_context
-def run_init_config(ctx: Context, force: bool):
+def run_init_config(ctx: Context, force: bool, incremental: Optional[bool]):
     """Initialize project config file."""
+    import glob
     import subprocess
 
     from wake.config import WakeConfig
@@ -553,7 +595,8 @@ def run_init_config(ctx: Context, force: bool):
     sol_files: Set[Path] = set()
     start = time.perf_counter()
     with console.status("[bold green]Searching for *.sol files...[/]"):
-        for file in config.project_root_path.rglob("**/*.sol"):
+        for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+            file = Path(f)
             if (
                 not any(
                     is_relative_to(file, p) for p in config.compiler.solc.exclude_paths
@@ -578,6 +621,7 @@ def run_init_config(ctx: Context, force: bool):
                 force_recompile=False,
                 console=console,
                 no_warnings=True,
+                incremental=incremental,
             )
         )
 
@@ -613,6 +657,7 @@ def run_init_config(ctx: Context, force: bool):
                     force_recompile=False,
                     console=console,
                     no_warnings=True,
+                    incremental=incremental,
                 )
             )
             stack_too_deep = any(
@@ -636,6 +681,7 @@ def run_init_config(ctx: Context, force: bool):
                         force_recompile=False,
                         console=console,
                         no_warnings=True,
+                        incremental=incremental,
                     )
                 )
 

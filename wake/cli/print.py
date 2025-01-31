@@ -122,9 +122,9 @@ class PrintCli(click.RichGroup):  # pyright: ignore reportPrivateImportUsage
         return frozenset(self._printer_collisions)
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        self.formatter.config.commands_panel_title = "Printers"
+        formatter.config.commands_panel_title = "Printers"
         super().format_help(ctx, formatter)
-        self.formatter.config.commands_panel_title = "Commands"
+        formatter.config.commands_panel_title = "Commands"
 
     def add_verified_plugin_path(self, path: Path) -> None:
         import tomli
@@ -362,6 +362,8 @@ async def print_(
     theme: str,
     watch: bool,
 ):
+    import glob
+
     from rich.terminal_theme import DEFAULT_TERMINAL_THEME, SVG_EXPORT_THEME
     from watchdog.observers import Observer
 
@@ -437,7 +439,8 @@ async def print_(
     sol_files: Set[Path] = set()
     start = time.perf_counter()
     with console.status("[bold green]Searching for *.sol files...[/]"):
-        for file in config.project_root_path.rglob("**/*.sol"):
+        for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+            file = Path(f)
             if (
                 not any(
                     is_relative_to(file, p) for p in config.compiler.solc.exclude_paths

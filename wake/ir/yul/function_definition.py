@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple, Union
 
 from wake.ir.ast import SolcYulFunctionDefinition
+from wake.utils.decorators import weak_self_lru_cache
 
 from ..enums import ModifiesStateFlag
 from ..utils import IrInitTuple
@@ -33,7 +35,7 @@ class YulFunctionDefinition(YulStatementAbc):
         ```
     """
 
-    _parent: YulBlock
+    _parent: weakref.ReferenceType[YulBlock]
     _body: YulBlock
     _name: str
     _parameters: List[YulTypedName]
@@ -79,7 +81,17 @@ class YulFunctionDefinition(YulStatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[Union[YulBlock, YulTypedName]]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._body
+        yield from self._parameters
+        yield from self._return_variables
 
     @property
     def body(self) -> YulBlock:
@@ -114,7 +126,7 @@ class YulFunctionDefinition(YulStatementAbc):
         return tuple(self._return_variables)
 
     @property
-    @lru_cache(maxsize=64)
+    @weak_self_lru_cache(maxsize=64)
     def cfg(self) -> ControlFlowGraph:
         """
         Returns:

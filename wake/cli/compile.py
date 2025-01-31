@@ -13,6 +13,35 @@ from wake.core.enums import EvmVersionEnum
 
 if TYPE_CHECKING:
     from wake.config import WakeConfig
+    from wake.compiler.build_data_model import ProjectBuild, ProjectBuildInfo
+    from wake.compiler.compiler import SolidityCompiler
+
+
+def export_json(config: WakeConfig, compiler: SolidityCompiler, build: ProjectBuild, build_info: ProjectBuildInfo):
+    import json
+    import platform
+
+    config_dict = config.todict(mode="json")
+    del config_dict["subconfigs"]
+    del config_dict["api_keys"]
+
+    out = {
+        "version": build_info.wake_version,
+        "system": platform.system(),
+        "project_root": str(config.project_root_path),
+        "wake_contracts_path": str(config.wake_contracts_path),
+        "config": config_dict,
+        "sources": {},
+    }
+
+    for path, source_unit in build.source_units.items():
+        out["sources"][str(path)] = {
+            "content": source_unit.file_source.decode("utf-8"),
+        }
+
+    output_dir = config.project_root_path / ".wake"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "sources.json").write_text(json.dumps(out))
 
 
 async def compile(
@@ -23,7 +52,10 @@ async def compile(
     force: bool,
     watch: bool,
     incremental: Optional[bool],
+    export: Optional[str],
 ):
+    import glob
+
     from watchdog.observers import Observer
 
     from wake.compiler.compiler import (
@@ -42,7 +74,8 @@ async def compile(
     start = time.perf_counter()
     with console.status("[bold green]Searching for *.sol files...[/]"):
         if len(paths) == 0:
-            for file in config.project_root_path.rglob("**/*.sol"):
+            for f in glob.iglob(str(config.project_root_path / "**/*.sol"), recursive=True):
+                file = Path(f)
                 if (
                     not any(
                         is_relative_to(file, p)
@@ -59,7 +92,8 @@ async def compile(
                         raise ValueError(f"Argument `{p}` is not a Solidity file.")
                     sol_files.add(path)
                 elif path.is_dir():
-                    for file in path.rglob("**/*.sol"):
+                    for f in glob.iglob(str(path / "**/*.sol"), recursive=True):
+                        file = Path(f)
                         if (
                             not any(
                                 is_relative_to(file, p)
@@ -86,6 +120,11 @@ async def compile(
             console=console,
             no_warnings=no_warnings,
         )
+
+        if export == "json":
+            fs_handler.register_callback(
+                lambda build, build_info: export_json(config, compiler, build, build_info)
+            )
 
         observer = Observer()
         observer.schedule(
@@ -128,6 +167,10 @@ async def compile(
         )
         if errored:
             sys.exit(2)
+        elif export == "json":
+            assert compiler.latest_build is not None
+            assert compiler.latest_build_info is not None
+            export_json(config, compiler, compiler.latest_build, compiler.latest_build_info)
 
 
 @click.command(name="compile")
@@ -239,6 +282,10 @@ async def compile(
     envvar="WAKE_COMPILE_VIA_IR",
     show_envvar=True,
 )
+@click.option(
+    "--export",
+    type=click.Choice(["json"]),
+)
 @click.pass_context
 def run_compile(
     ctx: Context,
@@ -257,6 +304,7 @@ def run_compile(
     remappings: Tuple[str],
     target_version: Optional[str],
     via_ir: Optional[bool],
+    export: Optional[str],
 ) -> None:
     """Compile the project."""
     from wake.config import WakeConfig
@@ -299,5 +347,5 @@ def run_compile(
     config.update({"compiler": {"solc": new_options}}, deleted_options)
 
     asyncio.run(
-        compile(config, paths, no_artifacts, no_warnings, force, watch, incremental)
+        compile(config, paths, no_artifacts, no_warnings, force, watch, incremental, export)
     )

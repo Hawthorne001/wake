@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from functools import lru_cache, reduce
+import weakref
+from functools import reduce
 from operator import or_
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple, Union
 
@@ -12,6 +13,7 @@ from wake.ir.enums import (
     ModifiesStateFlag,
     StateMutability,
 )
+from wake.utils.decorators import weak_self_lru_cache
 
 from ...utils import cached_return_on_recursion
 from ..ast import SolcFunctionCall
@@ -55,7 +57,7 @@ class FunctionCall(ExpressionAbc):
     """
 
     _ast_node: SolcFunctionCall
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _arguments: List[ExpressionAbc]
     _expression: ExpressionAbc
@@ -85,7 +87,16 @@ class FunctionCall(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._expression
+        yield from self._arguments
 
     @property
     def kind(self) -> FunctionCallKind:
@@ -149,7 +160,6 @@ class FunctionCall(ExpressionAbc):
         return tuple(self._arguments)
 
     @property
-    @lru_cache(maxsize=2048)
     def function_called(
         self,
     ) -> Optional[
@@ -242,7 +252,7 @@ class FunctionCall(ExpressionAbc):
                 ), f"Unexpected function call child node: {node}\n{self.source}"
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def is_ref_to_state_variable(self) -> bool:
         if self.kind == FunctionCallKind.TYPE_CONVERSION:
             return self.expression.is_ref_to_state_variable

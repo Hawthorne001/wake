@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "eth-wake"
-version = "4.9.0"
+version = "4.14.1"
 description = "Wake is a Python-based Solidity development and testing framework with built-in vulnerability detectors."
 license = "ISC"
 authors = ["Ackee Blockchain"]
@@ -15,7 +15,8 @@ packages = [
     { include = "wake_printers" }
 ]
 include = [
-    { path = "examples", format = ["sdist", "wheel"] }
+    { path = "examples", format = ["sdist", "wheel"] },
+    { path = "contracts/wake", format = ["sdist", "wheel"] }
 ]
 
 [tool.poetry.plugins."wake.plugins.detectors"]
@@ -25,8 +26,8 @@ wake-detectors = "wake_detectors"
 wake-printers = "wake_printers"
 
 [tool.poetry.dependencies]
-python = "^3.7.9"
-pydantic = "^1.9.1"
+python = "^3.8"
+pydantic = "^2.7"
 typing-extensions = "^4"
 aiohttp = [
     { version = "^3.8", python = "<3.12" },
@@ -46,10 +47,10 @@ eth-account = "^0.8"
 eth-utils = "^2.1"
 eth-abi = { version = "^4.0.0b2", allow-prereleases = true }
 parsimonious = "^0.9"
-eth-hash = { version = "^0.5.1", extras = ["pycryptodome"] }
+pycryptodome = ">=3.19.0"
 websocket-client = "^1.4"
 pywin32 = { version = ">= 302", platform = "win32" }
-watchdog = "~2.2.0"
+watchdog = "^4"
 pytest = "^7"
 ipdb = "^0.13.9"
 abch_tree_sitter = "^1.1.2"
@@ -60,15 +61,16 @@ packaging = ">=22.0"
 sarif-om = "^1.0.4"
 jschema-to-python = "^1.2.3"
 tomli-w = "^1.0.0"
+certifi = { version = ">=2024.2.2", platform = "darwin" }
 
 pytest-asyncio = { version = "^0.17", optional = true }
 GitPython = { version = "^3.1.20", optional = true }
 
 black = { version = "^22", optional = true }
-mkdocs-material = { version = "^9", optional = true }
-mkdocstrings = { version = "^0.20", optional = true }
-mkdocstrings-python = { version = "^1", optional = true }
-pymdown-extensions = { version = "^9", optional = true }
+mkdocs-material = { version = "^9.5.17", optional = true }
+mkdocstrings = { version = "^0.26", optional = true }
+mkdocstrings-python = { version = "^1.11", optional = true }
+pymdown-extensions = { version = "^10", optional = true }
 pygments = { version = "^2", optional = true }
 mike = { version = "^2.0.0", optional = true }
 isort = { version = "^5", optional = true }
@@ -99,7 +101,7 @@ target-version = ["py37"]
 [tool.pyright]
 include = ["**/*.py"]
 exclude = ["examples"]
-pythonVersion = "3.7"
+pythonVersion = "3.8"
 pythonPlatform = "All"
 
 [tool.isort]

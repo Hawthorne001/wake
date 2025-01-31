@@ -3,12 +3,14 @@ import os
 import platform
 import reprlib
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Set, Tuple, Union
 
 import networkx as nx
 import tomli
+from typing_extensions import Literal
 
+import wake.utils.file_utils
 from wake.core import get_logger
 from wake.utils import change_cwd
 
@@ -23,6 +25,7 @@ from .data_model import (
     LspConfig,
     PrinterConfig,
     PrintersConfig,
+    SubprojectConfig,
     TestingConfig,
     TopLevelConfig,
 )
@@ -43,6 +46,7 @@ class WakeConfig:
 
     __local_config_path: Path
     __project_root_path: Path
+    __wake_contracts_path: PurePath
     __global_config_path: Path
     __global_data_path: Path
     __global_cache_path: Path
@@ -55,6 +59,7 @@ class WakeConfig:
         *_,
         local_config_path: Optional[Union[str, Path]] = None,
         project_root_path: Optional[Union[str, Path]] = None,
+        wake_contracts_path: Optional[PurePath] = None,
     ):
         """
         Initialize the `WakeConfig` class. If `project_root_path` is not provided, the current working directory is used.
@@ -111,6 +116,11 @@ class WakeConfig:
         else:
             self.__local_config_path = Path(local_config_path).resolve()
 
+        if wake_contracts_path is None:
+            self.__wake_contracts_path = wake.utils.file_utils.wake_contracts_path
+        else:
+            self.__wake_contracts_path = wake_contracts_path
+
         if not self.__project_root_path.is_dir():
             raise ValueError(
                 f"Project root path '{self.__project_root_path}' is not a directory."
@@ -119,14 +129,14 @@ class WakeConfig:
         self.__loaded_files = set()
         with change_cwd(self.__project_root_path):
             self.__config = TopLevelConfig()
-        self.__config_raw = self.__config.dict(by_alias=True)
+        self.__config_raw = self.__config.model_dump(by_alias=True)
 
     def __str__(self) -> str:
         """
         Returns:
             JSON representation of the config.
         """
-        return self.__config.json(by_alias=True, exclude_unset=True)
+        return self.__config.model_dump_json(by_alias=True, exclude_unset=True)
 
     def __repr__(self) -> str:
         """
@@ -198,11 +208,13 @@ class WakeConfig:
                     raise ValueError(error)
 
                 # validate the loaded config
-                parsed_config = TopLevelConfig.parse_obj(loaded_config)
+                parsed_config = TopLevelConfig.model_validate(loaded_config)
 
                 # rebuild the loaded config from the pydantic model
                 # this ensures that all stored paths are absolute
-                loaded_config = parsed_config.dict(by_alias=True, exclude_unset=True)
+                loaded_config = parsed_config.model_dump(
+                    by_alias=True, exclude_unset=True
+                )
 
                 # merge the original config and the newly loaded config
                 self.__merge_dicts(new_config, loaded_config)
@@ -216,6 +228,8 @@ class WakeConfig:
         config_dict: Dict[str, Any],
         *,
         project_root_path: Optional[Union[str, Path]] = None,
+        wake_contracts_path: Optional[PurePath] = None,
+        paths_mode: Optional[str] = None,
     ) -> "WakeConfig":
         """
         Args:
@@ -225,24 +239,82 @@ class WakeConfig:
         Returns:
             Instance of the `WakeConfig` class with the provided config options.
         """
-        instance = cls(project_root_path=project_root_path)
+        instance = cls(
+            project_root_path=project_root_path, wake_contracts_path=wake_contracts_path
+        )
         with change_cwd(instance.project_root_path):
-            parsed_config = TopLevelConfig.parse_obj(config_dict)
-        instance.__config_raw = parsed_config.dict(by_alias=True, exclude_unset=True)
+            parsed_config = TopLevelConfig.model_validate(
+                config_dict, context={"paths_mode": paths_mode}
+            )
+        instance.__config_raw = parsed_config.model_dump(
+            by_alias=True, exclude_unset=True
+        )
         instance.__config = parsed_config
         return instance
 
-    def todict(self) -> Dict[str, Any]:
+    def todict(self, *, mode: Literal["python", "json"] = "python") -> Dict[str, Any]:
         """
         Returns:
             Dictionary containing the config options.
         """
-        return self.__config_raw
+        return self.__config.model_dump(by_alias=True, exclude_unset=True, mode=mode)
+
+    def set(
+        self,
+        config_dict: Dict[str, Any],
+        deleted_options: Iterable[Tuple[Union[int, str], ...]],
+    ) -> Dict:
+        """
+        Set the config to a new dictionary.
+
+        Args:
+            config_dict: Dictionary containing the new config options.
+            deleted_options: Iterable of config option paths (in the form of tuples of string keys and integer indices) that should be deleted from the config (reset to their default values).
+
+        Returns:
+            Dictionary containing the modified config options.
+        """
+        with change_cwd(self.project_root_path):
+            parsed_config = TopLevelConfig.model_validate(config_dict)
+        parsed_config_raw = parsed_config.model_dump(by_alias=True, exclude_unset=True)
+
+        original_config = deepcopy(self.__config_raw)
+        self.__config_raw = parsed_config_raw
+
+        for deleted_option in deleted_options:
+            conf = self.__config_raw
+            skip = False
+            for segment in deleted_option[:-1]:
+                if segment in conf:
+                    conf = conf[segment]  # type: ignore
+                else:
+                    skip = True
+                    break
+
+            if skip:
+                continue
+            if isinstance(conf, dict):
+                conf.pop(deleted_option[-1], None)  # type: ignore
+            elif isinstance(conf, list):
+                try:
+                    conf.remove(deleted_option[-1])
+                except ValueError:
+                    pass
+
+        self.__config = TopLevelConfig.model_validate(self.__config_raw)
+        modified_keys = {}
+        self.__modified_keys(
+            original_config,
+            self.__config.model_dump(by_alias=True, exclude_unset=True),
+            modified_keys,
+        )
+        return modified_keys
 
     def update(
         self,
         config_dict: Dict[str, Any],
         deleted_options: Iterable[Tuple[Union[int, str], ...]],
+        paths_mode: Optional[str] = None,
     ) -> Dict:
         """
         Update the config with a new dictionary.
@@ -255,8 +327,10 @@ class WakeConfig:
             Dictionary containing the modified config options.
         """
         with change_cwd(self.project_root_path):
-            parsed_config = TopLevelConfig.parse_obj(config_dict)
-        parsed_config_raw = parsed_config.dict(by_alias=True, exclude_unset=True)
+            parsed_config = TopLevelConfig.model_validate(
+                config_dict, context={"paths_mode": paths_mode}
+            )
+        parsed_config_raw = parsed_config.model_dump(by_alias=True, exclude_unset=True)
 
         original_config = deepcopy(self.__config_raw)
         self.__merge_dicts(self.__config_raw, parsed_config_raw)
@@ -281,11 +355,13 @@ class WakeConfig:
                 except ValueError:
                     pass
 
-        self.__config = TopLevelConfig.parse_obj(self.__config_raw)
+        self.__config = TopLevelConfig.model_validate(
+            self.__config_raw, context={"paths_mode": paths_mode}
+        )
         modified_keys = {}
         self.__modified_keys(
             original_config,
-            self.__config.dict(by_alias=True, exclude_unset=True),
+            self.__config.model_dump(by_alias=True, exclude_unset=True),
             modified_keys,
         )
         return modified_keys
@@ -299,7 +375,7 @@ class WakeConfig:
         self.__loaded_files = set()
         with change_cwd(self.__project_root_path):
             self.__config = TopLevelConfig()
-        self.__config_raw = self.__config.dict(by_alias=True)
+        self.__config_raw = self.__config.model_dump(by_alias=True)
 
         self.load(self.global_config_path)
         self.load(self.local_config_path)
@@ -317,7 +393,7 @@ class WakeConfig:
 
         self.__load_file(None, path.resolve(), config_raw_copy, subconfigs_graph)
 
-        config = TopLevelConfig.parse_obj(config_raw_copy)
+        config = TopLevelConfig.model_validate(config_raw_copy)
         self.__config_raw = config_raw_copy
         self.__config = config
         self.__loaded_files.update(
@@ -381,6 +457,14 @@ class WakeConfig:
         return self.__project_root_path
 
     @property
+    def wake_contracts_path(self) -> PurePath:
+        """
+        Returns:
+            System path to the Wake contracts directory.
+        """
+        return self.__wake_contracts_path
+
+    @property
     def min_solidity_version(self) -> SolidityVersion:
         """
         Returns:
@@ -394,7 +478,7 @@ class WakeConfig:
         Returns:
             Maximum supported Solidity version.
         """
-        return SolidityVersion.fromstring("0.8.25")
+        return SolidityVersion.fromstring("0.8.28")
 
     @property
     def detectors(self) -> DetectorsConfig:
@@ -427,6 +511,14 @@ class WakeConfig:
             Compiler config options.
         """
         return self.__config.compiler
+
+    @property
+    def subproject(self) -> Dict[str, SubprojectConfig]:
+        """
+        Returns:
+            Compilation config options for subprojects.
+        """
+        return self.__config.subproject
 
     @property
     def generator(self) -> GeneratorConfig:

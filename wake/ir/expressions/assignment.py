@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import lru_cache
+import weakref
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
 
 from typing_extensions import Literal
@@ -9,6 +9,7 @@ from wake.ir.abc import IrAbc, SolidityAbc
 from wake.ir.ast import SolcAssignment
 from wake.ir.enums import AssignmentOperator, GlobalSymbol, ModifiesStateFlag
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 from ..declarations.abc import DeclarationAbc
 from ..declarations.function_definition import FunctionDefinition
@@ -43,7 +44,7 @@ class Assignment(ExpressionAbc):
     """
 
     _ast_node: SolcAssignment
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _left_expression: ExpressionAbc
     _right_expression: ExpressionAbc
@@ -68,7 +69,16 @@ class Assignment(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._left_expression
+        yield self._right_expression
 
     @property
     def left_expression(self) -> ExpressionAbc:
@@ -97,12 +107,12 @@ class Assignment(ExpressionAbc):
         return self._operator
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def is_ref_to_state_variable(self) -> bool:
         return self.left_expression.is_ref_to_state_variable
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:
@@ -112,7 +122,6 @@ class Assignment(ExpressionAbc):
         return ret
 
     @property
-    @lru_cache(maxsize=2048)
     def assigned_variables(self) -> Tuple[Optional[Set[AssignedVariablePath]], ...]:
         """
         WARNING:
@@ -156,6 +165,8 @@ class Assignment(ExpressionAbc):
                     return {(function_called,)}
                 else:
                     assert False, f"Unexpected node type: {type(node)}\n{self.source}"
+            elif isinstance(node, TupleExpression) and len(node.components) == 1:
+                return resolve_node(node.components[0])
             else:
                 assert False, f"Unexpected node type: {type(node)}\n{self.source}"
 

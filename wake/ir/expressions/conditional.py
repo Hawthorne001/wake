@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Set, Tuple, Union
 
@@ -7,6 +8,7 @@ from wake.ir.abc import IrAbc, SolidityAbc
 from wake.ir.ast import SolcConditional
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 from .abc import ExpressionAbc
 
@@ -24,7 +26,7 @@ class Conditional(ExpressionAbc):
     """
 
     _ast_node: SolcConditional
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _condition: ExpressionAbc
     _false_expression: ExpressionAbc
@@ -50,7 +52,17 @@ class Conditional(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._condition
+        yield self._false_expression
+        yield self._true_expression
 
     @property
     def condition(self) -> ExpressionAbc:
@@ -77,7 +89,7 @@ class Conditional(ExpressionAbc):
         return self._true_expression
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def is_ref_to_state_variable(self) -> bool:
         return (
             self.true_expression.is_ref_to_state_variable
@@ -85,7 +97,7 @@ class Conditional(ExpressionAbc):
         )
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

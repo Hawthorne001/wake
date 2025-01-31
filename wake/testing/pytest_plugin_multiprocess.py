@@ -9,14 +9,24 @@ import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import TracebackType
-from typing import List, Optional, Type
+from typing import List, Optional, Type, Union, Tuple
 
 import pytest
 from pathvalidate import sanitize_filename
-from pytest import Session
+from pytest import (
+    Session,
+    Item,
+    Config,
+    CallInfo,
+    Collector,
+    CollectReport,
+    TestReport,
+    UsageError,
+)
 from tblib import pickling_support
 
 from wake.cli.console import console
+from wake.config.wake_config import WakeConfig
 from wake.development.globals import (
     attach_debugger,
     chain_interfaces_manager,
@@ -24,44 +34,62 @@ from wake.development.globals import (
     reset_exception_handled,
     set_coverage_handler,
     set_exception_handler,
+    get_sequence_initial_internal_state,
+    get_executing_flow_num,
+    get_executing_sequence_num,
+    get_fuzz_mode,
+    get_is_fuzzing,
 )
+
 from wake.testing.coverage import CoverageHandler
 from wake.utils.tee import StderrTee, StdoutTee
+
+from wake.testing.custom_pdb import CustomPdb
 
 
 class PytestWakePluginMultiprocess:
     _index: int
     _conn: multiprocessing.connection.Connection
+    _config: WakeConfig
     _coverage: Optional[CoverageHandler]
     _log_file: Path
+    _crash_log_file: Path
     _random_seed: bytes
     _tee: bool
     _debug: bool
     _exception_handled: bool
+    _crash_log_meta_data: List[Tuple[str, str]]
 
     _ctx_managers: List
+    _keyboard_interrupt: bool
 
     def __init__(
         self,
         index: int,
         conn: multiprocessing.connection.Connection,
         queue: multiprocessing.Queue,
+        config: WakeConfig,
         coverage: Optional[CoverageHandler],
         log_dir: Path,
+        crash_log_dir: Path,
         random_seed: bytes,
         tee: bool,
         debug: bool,
     ):
         self._conn = conn
         self._index = index
+        self._config = config
         self._queue = queue
         self._coverage = coverage
         self._log_file = log_dir / sanitize_filename(f"process-{index}.ansi")
+        self._crash_log_dir = crash_log_dir
         self._random_seed = random_seed
         self._tee = tee
         self._debug = debug
         self._exception_handled = False
+        self._crash_log_meta_data = []
 
+        self._keyboard_interrupt = False
         self._ctx_managers = []
 
     def _setup_stdio(self):
@@ -86,6 +114,14 @@ class PytestWakePluginMultiprocess:
         e: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:
+
+        # After the keyboard interrupt, we do not interested in debugging.
+        if self._keyboard_interrupt:
+            return
+
+        if self._exception_handled:
+            return
+
         self._cleanup_stdio()
         self._exception_handled = True
 
@@ -103,7 +139,7 @@ class PytestWakePluginMultiprocess:
         try:
             if attach:
                 sys.stdin = os.fdopen(0)
-                attach_debugger(e_type, e, tb)
+                attach_debugger(e_type, e, tb, seed=self._random_seed)
         finally:
             self._setup_stdio()
             self._conn.send(("exception_handled",))
@@ -139,11 +175,60 @@ class PytestWakePluginMultiprocess:
             )
         self._queue.put(("pytest_internalerror", self._index, pickled), block=True)
 
-    def pytest_exception_interact(self, node, call, report):
+    def pytest_exception_interact(
+        self,
+        node: Union[Item, Collector],
+        call: CallInfo,
+        report: Union[CollectReport, TestReport],
+    ):
+        import json
+        from datetime import datetime
+
         if self._debug and not self._exception_handled:
             self._exception_handler(
                 call.excinfo.type, call.excinfo.value, call.excinfo.tb
             )
+
+        if get_fuzz_mode() != 0:
+            return
+        random_state_dict = get_sequence_initial_internal_state()
+        if random_state_dict == {}:
+            return
+        if call.excinfo is None:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        crash_log_file = self._crash_log_dir / f"{timestamp}.json"
+
+        crash_data = {
+            "test_node_id": node.nodeid,
+            "crash_flow_number": get_executing_flow_num(),
+            "exception_content": {
+                "type": str(call.excinfo.type),
+                "value": str(call.excinfo.value),
+            },
+            "initial_random_state": random_state_dict,
+        }
+
+        with crash_log_file.open("w") as f:
+            json.dump(crash_data, f, indent=2)
+
+        self._crash_log_meta_data.append(
+            (
+                str(node.nodeid),
+                os.path.relpath(crash_log_file, self._config.project_root_path),
+            )
+        )
+
+        self._queue.put(
+            (
+                "pytest_crashlog_path",
+                self._index,
+                str(node.nodeid),
+                os.path.relpath(crash_log_file, self._config.project_root_path),
+            )
+        )
 
     def pytest_runtestloop(self, session: Session):
         if (
@@ -177,11 +262,67 @@ class PytestWakePluginMultiprocess:
                 except queue.Full:
                     pass
 
-        def signal_handler(sig, frame):
-            raise KeyboardInterrupt()
+        def custom_debugger():
+            self._cleanup_stdio()
+            import inspect
+
+            current_frame = inspect.currentframe()
+            assert current_frame is not None
+            caller_frame = current_frame.f_back
+            assert caller_frame is not None
+            filename = caller_frame.f_code.co_filename
+            lineno = caller_frame.f_lineno
+            function_name = caller_frame.f_code.co_name
+
+            source_lines, starting_line_no = inspect.getsourcelines(caller_frame)
+            lines_to_show = 10
+            relative_lineno = lineno - starting_line_no
+
+            start_line = max(0, relative_lineno - lines_to_show // 2)
+            end_line = min(len(source_lines), relative_lineno + lines_to_show // 2)
+
+            source_lines_subset = source_lines[start_line:end_line]
+
+            max_line_number = starting_line_no + end_line
+            line_number_width = len(str(max_line_number))
+
+            for idx, line in enumerate(source_lines_subset):
+                if start_line + idx == relative_lineno:
+                    source_lines_subset[idx] = (
+                        f"--> {starting_line_no + start_line + idx:>{line_number_width}} {line}"  # Add '>>>' marker
+                    )
+                else:
+                    source_lines_subset[idx] = (
+                        f"    {starting_line_no + start_line + idx:>{line_number_width}} {line}"
+                    )
+
+            source_code = "".join(source_lines_subset)
+
+            debugging_data = pickle.dumps(
+                (filename, lineno, function_name, source_code)
+            )
+            self._queue.put(("breakpoint", self._index, debugging_data), block=True)
+            attach: bool = self._conn.recv()
+            if attach:
+                prev = sys.stdin
+                sys.stdin = os.fdopen(0)
+                frame = sys._getframe(1)
+                p = CustomPdb(self)
+                p.set_trace(frame)
+            else:
+                # trace nothing, same as continue
+                self._conn.send(("breakpoint_handled",))
+
+        sys.breakpointhook = custom_debugger
 
         pickling_support.install()
-        signal.signal(signal.SIGTERM, signal_handler)
+
+        def sigint_handler(signum, frame):
+            self._keyboard_interrupt = True
+            self._queue.put(("keyboard_interrupt", self._index))
+            pytest.exit("Keyboard interrupt", returncode=0)
+
+        signal.signal(signal.SIGINT, sigint_handler)
 
         if self._debug:
             set_exception_handler(self._exception_handler)
@@ -193,6 +334,7 @@ class PytestWakePluginMultiprocess:
             indexes = self._conn.recv()
             for i in range(len(indexes)):
                 # set random seed before each test item
+
                 random.seed(self._random_seed)
                 console.print(f"Setting random seed '{self._random_seed.hex()}'")
 
@@ -226,6 +368,9 @@ class PytestWakePluginMultiprocess:
     # do not forward pytest_runtest_logstart and pytest_runtest_logfinish as they write item location to stdout which may be different for each process
 
     def pytest_runtest_logreport(self, report: pytest.TestReport):
+        # not sending exception report since the reason of exception is keyboard interrupt or at least triggered by keyboard interrupt
+        if self._keyboard_interrupt:
+            return
         self._queue.put(("pytest_runtest_logreport", self._index, report))
 
     def pytest_warning_recorded(self, warning_message, when, nodeid, location):
@@ -246,3 +391,15 @@ class PytestWakePluginMultiprocess:
     def pytest_terminal_summary(self, terminalreporter, exitstatus, config):
         terminalreporter.section("Wake")
         terminalreporter.write_line("Random seed: " + self._random_seed.hex())
+        if get_is_fuzzing():
+            terminalreporter.write_line(
+                "Executed sequence number: " + str(get_executing_sequence_num())
+            )
+            terminalreporter.write_line(
+                "Executed flow number: " + str(get_executing_flow_num())
+            )
+
+        if self._crash_log_meta_data:
+            terminalreporter.write_line("Crash logs:")
+            for node, crash_log in self._crash_log_meta_data:
+                terminalreporter.write_line(f"{node}: {crash_log}")

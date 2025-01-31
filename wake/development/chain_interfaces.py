@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import platform
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.error import URLError
 
@@ -10,9 +12,12 @@ from typing_extensions import Literal, TypedDict
 
 from wake.cli.console import console
 from wake.config import WakeConfig
+from wake.core import get_logger
 from wake.utils.networking import get_free_port
 
-from .json_rpc.communicator import JsonRpcCommunicator
+from .json_rpc.communicator import JsonRpcCommunicator, JsonRpcError
+
+logger = get_logger(__name__)
 
 TxParams = TypedDict(
     "TxParams",
@@ -191,7 +196,15 @@ class ChainInterfaceAbc(ABC):
                 args += ["-k", hardfork]
 
         console.print(f"Launching {' '.join(args)}")
-        process = subprocess.Popen(args, stdout=subprocess.DEVNULL)
+        try:
+            process = subprocess.Popen(args, stdout=subprocess.DEVNULL, start_new_session=True)
+        except FileNotFoundError:
+            if args[0] == "anvil" and platform.system() != "Windows":
+                args[0] = str(Path.home() / ".foundry/bin/anvil")
+                console.print(f"Launching {' '.join(args)}")
+                process = subprocess.Popen(args, stdout=subprocess.DEVNULL, start_new_session=True)
+            else:
+                raise
 
         try:
             start = time.perf_counter()
@@ -244,12 +257,25 @@ class ChainInterfaceAbc(ABC):
             elif chain_id in {1101, 1442}:
                 return HermezChainInterface(config, communicator)
             else:
-                raise NotImplementedError(
-                    f"Client version {client_version} not supported"
+                logger.warning(
+                    f"Unknown node '{client_version}', falling back to Geth-like interface"
                 )
+                return GethChainInterface(config, communicator)
+        except JsonRpcError:
+            logger.warning(f"Unknown node, falling back to Geth-like interface")
+            return GethChainInterface(config, communicator)
         except Exception:
             communicator.__exit__(None, None, None)
             raise
+
+    @property
+    def connection_uri(self) -> str:
+        return self._communicator.uri
+
+    @property
+    @abstractmethod
+    def type(self) -> str:
+        ...
 
     def close(self) -> None:
         self._communicator.__exit__(None, None, None)
@@ -523,6 +549,10 @@ class ChainInterfaceAbc(ABC):
 
 
 class HardhatChainInterface(ChainInterfaceAbc):
+    @property
+    def type(self) -> str:
+        return "hardhat"
+
     def get_accounts(self) -> List[str]:
         return self._communicator.send_request("eth_accounts")
 
@@ -594,6 +624,10 @@ class HardhatChainInterface(ChainInterfaceAbc):
 
 
 class AnvilChainInterface(ChainInterfaceAbc):
+    @property
+    def type(self) -> str:
+        return "anvil"
+
     def get_accounts(self) -> List[str]:
         return self._communicator.send_request("eth_accounts")
 
@@ -659,8 +693,18 @@ class AnvilChainInterface(ChainInterfaceAbc):
             else [hex(num_blocks)],
         )
 
+    def dump_state(self) -> str:
+        return self._communicator.send_request("anvil_dumpState")
+
+    def load_state(self, state: str) -> None:
+        self._communicator.send_request("anvil_loadState", [state])
+
 
 class GanacheChainInterface(ChainInterfaceAbc):
+    @property
+    def type(self) -> str:
+        return "ganache"
+
     def get_accounts(self) -> List[str]:
         return self._communicator.send_request("eth_accounts")
 
@@ -732,6 +776,10 @@ class GanacheChainInterface(ChainInterfaceAbc):
 
 
 class GethLikeChainInterfaceAbc(ChainInterfaceAbc, ABC):
+    @property
+    def type(self) -> str:
+        return self._name.lower()
+
     @property
     @abstractmethod
     def _name(self) -> str:

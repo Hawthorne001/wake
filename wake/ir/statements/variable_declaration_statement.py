@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple, Union
 
@@ -10,6 +11,7 @@ from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.statements.abc import StatementAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..yul.abc import YulAbc
@@ -35,13 +37,15 @@ class VariableDeclarationStatement(StatementAbc):
     """
 
     _ast_node: SolcVariableDeclarationStatement
-    _parent: Union[
-        Block,
-        DoWhileStatement,
-        ForStatement,
-        IfStatement,
-        UncheckedBlock,
-        WhileStatement,
+    _parent: weakref.ReferenceType[
+        Union[
+            Block,
+            DoWhileStatement,
+            ForStatement,
+            IfStatement,
+            UncheckedBlock,
+            WhileStatement,
+        ]
     ]
 
     _assignments: List[Optional[AstNodeId]]
@@ -94,7 +98,19 @@ class VariableDeclarationStatement(StatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[Union[VariableDeclaration, ExpressionAbc]]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        for declaration in self.declarations:
+            if declaration is not None:
+                yield declaration
+        if self.initial_value is not None:
+            yield self.initial_value
 
     @property
     def declarations(self) -> Tuple[Optional[VariableDeclaration], ...]:
@@ -122,7 +138,7 @@ class VariableDeclarationStatement(StatementAbc):
         return self._initial_value
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:
