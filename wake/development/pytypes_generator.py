@@ -55,7 +55,7 @@ from wake.ir import (
 )
 from wake.ir.enums import ContractKind, FunctionKind, StateMutability, Visibility
 from wake.ir.reference_resolver import ReferenceResolver
-from wake.utils import get_package_version
+from wake.utils import get_package_version, is_relative_to
 
 from .constants import DEFAULT_IMPORTS, INIT_CONTENT, TAB_WIDTH
 
@@ -187,7 +187,7 @@ class TypeGenerator:
         self.__already_generated_contracts = set()
         self.__source_units = {}
         self.__interval_trees = {}
-        self.__reference_resolver = ReferenceResolver()
+        self.__reference_resolver = ReferenceResolver(lsp=False)
         self.__imports = SourceUnitImports(self)
         self.__name_sanitizer = NameSanitizer()
         self.__current_source_unit = ""
@@ -552,11 +552,31 @@ class TypeGenerator:
                 index,
             )
 
-        if len(compilation_info.evm.deployed_bytecode.object) > 0:
-            metadata = bytes.fromhex(
-                compilation_info.evm.deployed_bytecode.object[-106:]
+        config = next(
+            (
+                config
+                for config in self.__config.subproject.values()
+                if any(
+                    is_relative_to(contract.source_unit.file, p) for p in config.paths
+                )
+            ),
+            self.__config.compiler.solc,
+        )
+
+        if (
+            len(compilation_info.evm.deployed_bytecode.object) > 0
+            and config.metadata.append_CBOR != False
+            and config.metadata.bytecode_hash != "none"
+        ):
+            metadata_length = int.from_bytes(
+                bytes.fromhex(compilation_info.evm.deployed_bytecode.object[-4:]),
+                "big",
             )
-            assert len(metadata) == 53
+            metadata = bytes.fromhex(
+                compilation_info.evm.deployed_bytecode.object[
+                    -metadata_length * 2 - 4 : -4
+                ]
+            )
             assert metadata not in self.__contracts_by_metadata_index
             self.__contracts_by_metadata_index[metadata] = fqn
 
@@ -574,10 +594,6 @@ class TypeGenerator:
             ],
             Dict,
         ] = {}
-
-        module_name = "pytypes." + _make_path_alphanum(
-            contract.parent.source_unit_name[:-3]
-        ).replace("/", ".")
 
         for item in compilation_info.abi:
             if item["type"] == "function":
@@ -618,7 +634,7 @@ class TypeGenerator:
                 if isinstance(error_decl.parent, ContractDefinition):
                     # error is declared in a contract
                     error_module_name = "pytypes." + _make_path_alphanum(
-                        error_decl.parent.parent.source_unit_name[:-3]
+                        error_decl.parent.parent.source_unit_name[:-4].replace(".", "_")
                     ).replace("/", ".")
                     self.__errors_index[selector][fqn] = (
                         error_module_name,
@@ -626,7 +642,7 @@ class TypeGenerator:
                     )
                 elif isinstance(error_decl.parent, SourceUnit):
                     error_module_name = "pytypes." + _make_path_alphanum(
-                        error_decl.parent.source_unit_name[:-3]
+                        error_decl.parent.source_unit_name[:-4].replace(".", "_")
                     ).replace("/", ".")
                     self.__errors_index[selector][fqn] = (
                         error_module_name,
@@ -653,7 +669,7 @@ class TypeGenerator:
                 if isinstance(event_decl.parent, ContractDefinition):
                     # event is declared in a contract
                     event_module_name = "pytypes." + _make_path_alphanum(
-                        event_decl.parent.parent.source_unit_name[:-3]
+                        event_decl.parent.parent.source_unit_name[:-4].replace(".", "_")
                     ).replace("/", ".")
                     self.__events_index[selector][fqn] = (
                         event_module_name,
@@ -661,7 +677,7 @@ class TypeGenerator:
                     )
                 elif isinstance(event_decl.parent, SourceUnit):
                     event_module_name = "pytypes." + _make_path_alphanum(
-                        event_decl.parent.source_unit_name[:-3]
+                        event_decl.parent.source_unit_name[:-4].replace(".", "_")
                     ).replace("/", ".")
                     self.__events_index[selector][fqn] = (
                         event_module_name,
@@ -678,7 +694,7 @@ class TypeGenerator:
         if compilation_info.storage_layout is not None:
             self.add_str_to_types(
                 1,
-                f"_storage_layout = {compilation_info.storage_layout.json(by_alias=True, exclude_none=True)}",
+                f"_storage_layout = {compilation_info.storage_layout.model_dump_json(by_alias=True, exclude_none=True)}",
                 1,
             )
 
@@ -886,7 +902,9 @@ class TypeGenerator:
             self.add_str_to_types(indent + 1, '"""', 1)
             self.add_str_to_types(indent + 1, f"_abi = {error_abi}", 1)
             self.add_str_to_types(indent + 1, f"original_name = '{error.name}'", 1)
-            self.add_str_to_types(indent + 1, f"selector = {error.error_selector}", 2)
+            self.add_str_to_types(
+                indent + 1, f"selector = bytes4({error.error_selector})", 2
+            )
             for param_name, param_type, _, original_name in parameters:
                 if param_name == original_name:
                     self.add_str_to_types(indent + 1, f"{param_name}: {param_type}", 1)
@@ -981,7 +999,9 @@ class TypeGenerator:
                 1,
             )
             self.add_str_to_types(indent + 1, f"original_name = '{event.name}'", 1)
-            self.add_str_to_types(indent + 1, f"selector = {event.event_selector}", 2)
+            self.add_str_to_types(
+                indent + 1, f"selector = bytes32({event.event_selector})", 2
+            )
             for param_name, param_type, _, original_name in parameters:
                 if param_name == original_name:
                     self.add_str_to_types(indent + 1, f"{param_name}: {param_type}", 1)
@@ -1069,9 +1089,11 @@ class TypeGenerator:
             )
         return param_names, params
 
-    def generate_func_returns(self, fn: FunctionDefinition) -> List[Tuple[str, str]]:
+    def generate_func_returns(
+        self, fn: FunctionDefinition
+    ) -> List[Tuple[str, str, str]]:
         return [
-            (self.parse_type_and_import(par.type, True), par.type_string)
+            (self.parse_type_and_import(par.type, True), par.type_string, par.name)
             for par in fn.return_parameters.parameters
         ]
 
@@ -1082,11 +1104,12 @@ class TypeGenerator:
     def generate_getter_for_state_var(self, decl: VariableDeclaration):
         def get_struct_return_list(
             struct_type_name: UserDefinedTypeName,
-        ) -> List[Tuple[str, str]]:
+            var_name: str,
+        ) -> List[Tuple[str, str, str]]:
             struct = struct_type_name.type
             assert isinstance(struct, types.Struct)
             node = struct.ir_node
-            non_excluded: List[Tuple[str, str]] = []
+            non_excluded: List[Tuple[str, str, str]] = []
             for member in node.members:
                 if not isinstance(member.type, types.Mapping) and not isinstance(
                     member.type, types.Array
@@ -1095,6 +1118,7 @@ class TypeGenerator:
                         (
                             self.parse_type_and_import(member.type, True),
                             member.type_string,
+                            member.name,
                         )
                     )
             if len(node.members) == len(non_excluded):
@@ -1106,23 +1130,28 @@ class TypeGenerator:
                         (
                             f"{self.get_name(parent)}.{self.get_name(struct.ir_node)}",
                             struct_type_name.type_string,
+                            var_name,
                         )
                     ]
                 else:
                     self.__imports.generate_struct_import(struct)
                     return [
-                        (self.get_name(struct.ir_node), struct_type_name.type_string)
+                        (
+                            self.get_name(struct.ir_node),
+                            struct_type_name.type_string,
+                            var_name,
+                        )
                     ]
             else:
                 return non_excluded
 
-        returns: List[Tuple[str, str]] = []
+        returns: List[Tuple[str, str, str]] = []
         param_names: List[Tuple[str, str]] = []
         # if the type is compound we need to use the type as an index, for primitive types we use the
         # the type only for the return
         # TODO reorder the elif chain such that the most common types are on the top
         def generate_getter_helper(
-            var_type_name: TypeNameAbc, use_parse: bool, depth: int
+            var_type_name: TypeNameAbc, use_parse: bool, depth: int, var_name: str
         ) -> List[str]:
             nonlocal returns
             nonlocal param_names
@@ -1142,7 +1171,7 @@ class TypeGenerator:
                         self.__imports.generate_struct_import(var_type)
                         parsed.append(self.get_name(var_type.ir_node))
                 assert isinstance(var_type_name, UserDefinedTypeName)
-                returns = get_struct_return_list(var_type_name)
+                returns = get_struct_return_list(var_type_name, var_name)
             elif isinstance(var_type, types.Enum):
                 parent = var_type.ir_node.parent
                 if isinstance(parent, ContractDefinition):
@@ -1154,6 +1183,7 @@ class TypeGenerator:
                         (
                             f"{self.get_name(parent)}.{self.get_name(var_type.ir_node)}",
                             var_type_name.type_string,
+                            var_name,
                         )
                     ]
 
@@ -1161,7 +1191,11 @@ class TypeGenerator:
                     self.__imports.generate_enum_import(var_type)
                     parsed.append(self.get_name(var_type.ir_node))
                     returns = [
-                        (self.get_name(var_type.ir_node), var_type_name.type_string)
+                        (
+                            self.get_name(var_type.ir_node),
+                            var_type_name.type_string,
+                            var_name,
+                        )
                     ]
             elif isinstance(var_type, types.UserDefinedValueType):
                 underlying_type = var_type.ir_node.underlying_type.type
@@ -1171,17 +1205,26 @@ class TypeGenerator:
                         (
                             f"bytes{underlying_type.bytes_count}",
                             var_type_name.type_string,
+                            var_name,
                         )
                     ]
                 elif isinstance(underlying_type, types.Int):
                     parsed.append(f"int{underlying_type.bits_count}")
                     returns = [
-                        (f"int{underlying_type.bits_count}", var_type_name.type_string)
+                        (
+                            f"int{underlying_type.bits_count}",
+                            var_type_name.type_string,
+                            var_name,
+                        )
                     ]
                 elif isinstance(underlying_type, types.UInt):
                     parsed.append(f"uint{underlying_type.bits_count}")
                     returns = [
-                        (f"uint{underlying_type.bits_count}", var_type_name.type_string)
+                        (
+                            f"uint{underlying_type.bits_count}",
+                            var_type_name.type_string,
+                            var_name,
+                        )
                     ]
                 else:
                     parsed.append(
@@ -1193,6 +1236,7 @@ class TypeGenerator:
                                 1
                             ],
                             var_type_name.type_string,
+                            var_name,
                         )
                     ]
             elif isinstance(var_type, types.Array):
@@ -1202,12 +1246,14 @@ class TypeGenerator:
                 assert isinstance(var_type_name, ArrayTypeName)
                 if self.is_compound_type(var_type.base_type):
                     parsed.extend(
-                        generate_getter_helper(var_type_name.base_type, True, depth + 1)
+                        generate_getter_helper(
+                            var_type_name.base_type, True, depth + 1, ""
+                        )
                     )
                 else:
                     # ignores the parsed return, only called for the side-effect of changing the returns var to value_type
                     _ = generate_getter_helper(
-                        var_type_name.base_type, False, depth + 1
+                        var_type_name.base_type, False, depth + 1, ""
                     )
             elif isinstance(var_type, types.Mapping):
                 # parse key
@@ -1217,46 +1263,72 @@ class TypeGenerator:
                     ("key" + str(depth), var_type_name.key_type.type_string)
                 )
                 key_type = generate_getter_helper(
-                    var_type_name.key_type, True, depth + 1
+                    var_type_name.key_type,
+                    True,
+                    depth + 1,
+                    var_type_name.key_name or "",
                 )
                 assert len(key_type) == 1
                 parsed.append(f"key{depth}: {key_type[0]}")
                 if self.is_compound_type(var_type.value_type):
                     parsed.extend(
                         generate_getter_helper(
-                            var_type_name.value_type, True, depth + 1
+                            var_type_name.value_type,
+                            True,
+                            depth + 1,
+                            var_type_name.value_name or "",
                         )
                     )
                 else:
                     # ignores the parsed return, only called for the side-effect of changing the returns var to value_type
                     _ = generate_getter_helper(
-                        var_type_name.value_type, True, depth + 1
+                        var_type_name.value_type,
+                        True,
+                        depth + 1,
+                        var_type_name.value_name or "",
                     )
             elif isinstance(var_type, types.Contract):
                 self.__imports.generate_contract_import(var_type.ir_node)
                 parsed.append(self.get_name(var_type.ir_node))
-                returns = [(self.get_name(var_type.ir_node), var_type_name.type_string)]
+                returns = [
+                    (
+                        self.get_name(var_type.ir_node),
+                        var_type_name.type_string,
+                        var_name,
+                    )
+                ]
             elif isinstance(var_type, types.FixedBytes):
                 parsed.append(f"bytes{var_type.bytes_count}")
-                returns = [(f"bytes{var_type.bytes_count}", var_type_name.type_string)]
+                returns = [
+                    (
+                        f"bytes{var_type.bytes_count}",
+                        var_type_name.type_string,
+                        var_name,
+                    )
+                ]
             elif isinstance(var_type, types.Int):
                 parsed.append(f"int{var_type.bits_count}")
-                returns = [(f"int{var_type.bits_count}", var_type_name.type_string)]
+                returns = [
+                    (f"int{var_type.bits_count}", var_type_name.type_string, var_name)
+                ]
             elif isinstance(var_type, types.UInt):
                 parsed.append(f"uint{var_type.bits_count}")
-                returns = [(f"uint{var_type.bits_count}", var_type_name.type_string)]
+                returns = [
+                    (f"uint{var_type.bits_count}", var_type_name.type_string, var_name)
+                ]
             else:
                 parsed.append(self.__sol_to_py_lookup[var_type.__class__.__name__][0])
                 returns = [
                     (
                         self.__sol_to_py_lookup[var_type.__class__.__name__][1],
                         var_type_name.type_string,
+                        var_name,
                     )
                 ]
 
             return parsed if use_parse else []
 
-        generated_params = generate_getter_helper(decl.type_name, False, 0)
+        generated_params = generate_getter_helper(decl.type_name, False, 0, decl.name)
 
         if len(returns) == 0:
             returns_str = "None"
@@ -1317,7 +1389,7 @@ class TypeGenerator:
         declaration: Union[FunctionDefinition, VariableDeclaration],
         params: List[str],
         param_names: List[Tuple[str, str]],
-        returns: List[Tuple[str, str]],
+        returns: List[Tuple[str, str, str]],
     ):
         is_view_or_pure: bool = isinstance(
             declaration, VariableDeclaration
@@ -1351,12 +1423,13 @@ class TypeGenerator:
             self.add_str_to_types(2, "Args:", 1)
             for param_name, param_type in param_names:
                 self.add_str_to_types(3, f"{param_name}: {param_type}", 1)
-        if len(returns) == 1:
+        if len(returns) > 0:
             self.add_str_to_types(2, "Returns:", 1)
-            self.add_str_to_types(3, f"{returns[0][1]}", 1)
-        elif len(returns) > 1:
-            self.add_str_to_types(2, "Returns:", 1)
-            self.add_str_to_types(3, f'({", ".join(ret[1] for ret in returns)})', 1)
+            for _, return_type, return_name in returns:
+                if return_name:
+                    self.add_str_to_types(3, f"{return_name}: {return_type}", 1)
+                else:
+                    self.add_str_to_types(3, f"{return_type}", 1)
         self.add_str_to_types(2, '"""', 1)
 
         if len(returns) == 0:
@@ -1382,7 +1455,7 @@ class TypeGenerator:
         request_type: str,
         request_type_is_default: bool,
         param_names: List[Tuple[str, str]],
-        returns: List[Tuple[str, str]],
+        returns: List[Tuple[str, str, str]],
     ):
         params_str = "".join(param + ", " for param in params)
 
@@ -1405,12 +1478,13 @@ class TypeGenerator:
             self.add_str_to_types(2, "Args:", 1)
             for param_name, param_type in param_names:
                 self.add_str_to_types(3, f"{param_name}: {param_type}", 1)
-        if len(returns) == 1:
+        if len(returns) > 0:
             self.add_str_to_types(2, "Returns:", 1)
-            self.add_str_to_types(3, f"{returns[0][1]}", 1)
-        elif len(returns) > 1:
-            self.add_str_to_types(2, "Returns:", 1)
-            self.add_str_to_types(3, f'({", ".join(ret[1] for ret in returns)})', 1)
+            for _, return_type, return_name in returns:
+                if return_name:
+                    self.add_str_to_types(3, f"{return_name}: {return_type}", 1)
+                else:
+                    self.add_str_to_types(3, f"{return_type}", 1)
         self.add_str_to_types(2, '"""', 1)
         self.add_str_to_types(2, "...", 2)
 
@@ -1500,7 +1574,7 @@ class TypeGenerator:
                 self.__imports.generate_contract_import(parent_contract, force=True)
 
         contract_module_name = "pytypes." + _make_path_alphanum(
-            contract.parent.source_unit_name[:-3]
+            contract.parent.source_unit_name[:-4].replace(".", "_")
         ).replace("/", ".")
         self.__contracts_index[fqn] = (
             contract_module_name,
@@ -1546,7 +1620,9 @@ class TypeGenerator:
 
         for fn_name, selector in selector_assignments:
             self.add_str_to_types(
-                0, f"{self.get_name(contract)}.{fn_name}.selector = {selector}", 1
+                0,
+                f"{self.get_name(contract)}.{fn_name}.selector = bytes4({selector})",
+                1,
             )
 
     def generate_types_source_unit(self, unit: SourceUnit) -> None:
@@ -1581,7 +1657,7 @@ class TypeGenerator:
             lists += f"class List{a}(FixedSizeList[T]):\n    length = {a}\n\n\n"
 
         self.__pytypes_dir.mkdir(exist_ok=True)
-        contract_name = _make_path_alphanum(contract_name[:-3])
+        contract_name = _make_path_alphanum(contract_name[:-4].replace(".", "_"))
         unit_path = (self.__pytypes_dir / contract_name).with_suffix(".py")
         unit_path.parent.mkdir(parents=True, exist_ok=True)
         unit_path.write_text(str(self.__imports) + lists + self.__source_unit_types)
@@ -1711,7 +1787,7 @@ class TypeGenerator:
                 for node, in_degree in graph.in_degree()  # pyright: ignore reportGeneralTypeIssues
                 if in_degree == 0
             ]
-            heapq.heapify(sources)
+            heapq.heapify(sorted(sources))
             visited: Set[str] = set(sources)
 
             while len(sources) > 0:
@@ -1741,6 +1817,7 @@ class TypeGenerator:
 
             generated_cycles: Set[FrozenSet[str]] = set()
             simple_cycles = [set(c) for c in nx.simple_cycles(graph)]
+            simple_cycles.sort(key=lambda cycle: sorted(cycle))
             if len(simple_cycles) > 0:
                 # used for reporting to user
                 cycles_detected = True
@@ -1900,20 +1977,24 @@ class SourceUnitImports:
         *,
         aliased: bool = False,
     ) -> str:
-        source_unit_name = _make_path_alphanum(source_unit_name)
+        source_unit_name = _make_path_alphanum(
+            source_unit_name[:-4].replace(".", "_")
+        ).replace("/", ".")
         name = self.__type_gen.get_name(declaration, force_simple=True)
 
         if aliased:
-            return f"import pytypes.{source_unit_name[:-3].replace('/', '.')} as {name}"
-        return f"from pytypes.{source_unit_name[:-3].replace('/', '.')} import {name}"
+            return f"import pytypes.{source_unit_name} as {name}"
+        return f"from pytypes.{source_unit_name} import {name}"
 
     def __generate_lazy_module(
         self, declaration: DeclarationAbc, source_unit_name: str
     ) -> str:
-        source_unit_name = _make_path_alphanum(source_unit_name)
+        source_unit_name = _make_path_alphanum(
+            source_unit_name[:-4].replace(".", "_")
+        ).replace("/", ".")
         name = self.__type_gen.get_name(declaration, force_simple=True)
 
-        return f"{name} = lazy_import.lazy_module('pytypes.{source_unit_name[:-3].replace('/', '.')}')"
+        return f"{name} = lazy_import.lazy_module('pytypes.{source_unit_name}')"
 
     def __add_str_to_imports(
         self, num_of_indentation: int, string: str, num_of_newlines: int

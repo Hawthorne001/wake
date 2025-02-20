@@ -1,7 +1,9 @@
 import multiprocessing
 import multiprocessing.connection
+import os
 import pickle
 import shutil
+import signal
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -38,6 +40,7 @@ class PytestWakePluginMultiprocessServer:
     _exported_coverages: Dict[
         int, Dict[Path, Dict[IdePosition, IdeFunctionCoverageRecord]]
     ]
+    _crash_log_meta_data: List[Tuple[str, int, str]]
 
     def __init__(
         self,
@@ -61,6 +64,8 @@ class PytestWakePluginMultiprocessServer:
         self._pytest_args = pytest_args
         self._exported_coverages = {i: {} for i in range(self._proc_count)}
 
+        self._crash_log_meta_data = []
+
     def pytest_sessionstart(self, session: pytest.Session):
         if self._coverage != 0:
             empty_coverage = CoverageHandler(self._config)
@@ -73,9 +78,16 @@ class PytestWakePluginMultiprocessServer:
         shutil.rmtree(logs_dir, ignore_errors=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
 
+        crash_logs_dir = self._config.project_root_path / ".wake" / "logs" / "crashes"
+        crash_logs_dir.mkdir(parents=True, exist_ok=True)
+        # write crash log file.
+
         self._queue = multiprocessing.Queue(1000)
 
         for i in range(self._proc_count):
+            crash_logs_process_dir = crash_logs_dir / f"process-{i}"
+            crash_logs_process_dir.mkdir(parents=True, exist_ok=True)
+
             parent_conn, child_conn = multiprocessing.Pipe()
             p = multiprocessing.Process(
                 target=pytest.main,
@@ -86,8 +98,10 @@ class PytestWakePluginMultiprocessServer:
                             i,
                             child_conn,  # pyright: ignore reportGeneralTypeIssues
                             self._queue,
+                            self._config,
                             empty_coverage if i < self._coverage else None,
                             logs_dir,
+                            crash_logs_process_dir,
                             self._random_seeds[i],
                             self._attach_first and i == 0,
                             self._debug,
@@ -101,14 +115,15 @@ class PytestWakePluginMultiprocessServer:
                 parent_conn,
             )
             p.start()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     def pytest_sessionfinish(self, session: pytest.Session):
         self._queue.cancel_join_thread()
         for p, conn in self._processes.values():
-            p.terminate()
+            if p.pid is not None:
+                os.kill(p.pid, signal.SIGINT)
             p.join()
             conn.close()
-
         self._queue.close()
 
         # flush coverage
@@ -177,6 +192,7 @@ class PytestWakePluginMultiprocessServer:
         )
 
         try:
+            keyboard_interrupt = [False for _ in range(self._proc_count)]
             with ctx as progress:
                 if progress is not None:
                     tasks = [
@@ -244,6 +260,38 @@ class PytestWakePluginMultiprocessServer:
                         )
                         if progress is not None:
                             progress.start()
+                    elif msg[0] == "breakpoint":
+
+                        (filename, lineno, function_name, syntax) = pickle.loads(msg[2])
+                        if progress is not None:
+                            progress.stop()
+
+                            console.print(syntax)
+                            console.print(
+                                f"Process #{index} reached breakpoint in {function_name} at {filename}:{lineno}."
+                            )
+
+                            attach = None
+                            while attach is None:
+                                response = input(
+                                    "Would you like to attach the debugger? ('n' to continue operations) [y/n] "
+                                )
+                                if response == "y":
+                                    attach = True
+                                elif response == "n":
+                                    attach = False
+                        else:
+                            attach = False
+
+                        self._processes[index][1].send(attach)
+
+                        # wait for debugger to finish
+                        assert self._processes[index][1].recv() == (
+                            "breakpoint_handled",
+                        )
+                        if progress is not None:
+                            progress.start()
+
                     elif msg[0] == "pytest_runtest_logreport":
                         report: pytest.TestReport = msg[2]
                         reports.append(report)
@@ -268,7 +316,13 @@ class PytestWakePluginMultiprocessServer:
                         )
                     elif msg[0] == "pytest_sessionfinish":
                         if progress is not None:
-                            progress.update(tasks[index], description=f"Finished")
+                            if keyboard_interrupt[index]:
+                                text = f"#{index} interrupted [yellow]⚠[/yellow]"
+                            elif msg[2] == 0:
+                                text = f"#{index} finished [green]✓[/green]"
+                            else:
+                                text = f"#{index} failed [red]✗[/red]"
+                            progress.update(tasks[index], description=text)
 
                         self._processes.pop(index)
                     elif msg[0] == "pytest_internalerror":
@@ -279,6 +333,14 @@ class PytestWakePluginMultiprocessServer:
                         session.config.hook.pytest_internalerror(
                             excrepr=exc_info.getrepr(style="short"), excinfo=exc_info
                         )
+                    elif msg[0] == "keyboard_interrupt":
+                        keyboard_interrupt[index] = True
+
+                    elif msg[0] == "pytest_crashlog_path":
+                        self._crash_log_meta_data.append((msg[1], msg[2], msg[3]))
+
+            if True in keyboard_interrupt:
+                raise KeyboardInterrupt
         finally:
             print("")
             for report in reports:
@@ -292,6 +354,11 @@ class PytestWakePluginMultiprocessServer:
             "Random seeds: "
             + ", ".join(s.hex() for s in self._random_seeds[: self._proc_count])
         )
+
+        if self._crash_log_meta_data:
+            terminalreporter.write_line("Crash logs:")
+            for index, node, crash_log in self._crash_log_meta_data:
+                terminalreporter.write_line(f"{node} process-{index}: {crash_log}")
 
     def _update_progress(
         self,

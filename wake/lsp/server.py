@@ -19,7 +19,7 @@ from typing import (
 )
 
 import tomli
-from pydantic.error_wrappers import ValidationError
+from pydantic import ValidationError
 
 from wake.core import get_logger
 from wake.utils import StrEnum, is_relative_to
@@ -64,10 +64,16 @@ from .common_structures import (
     SetTraceParams,
     ShowMessageParams,
     ShowMessageRequestParams,
+    TextDocumentContentParams,
+    TextDocumentContentResult,
+    WatchKind,
     WorkDoneProgressBegin,
     WorkDoneProgressCreateParams,
     WorkDoneProgressEnd,
     WorkDoneProgressReport,
+    WorkspaceSymbol,
+    WorkspaceSymbolOptions,
+    WorkspaceSymbolParams,
 )
 from .context import LspContext
 from .document_sync import (
@@ -110,6 +116,7 @@ from .features.type_hierarchy import (
     subtypes,
     supertypes,
 )
+from .features.workspace_symbol import workspace_symbol, workspace_symbol_resolve
 from .lsp_data_model import LspModel
 from .methods import RequestMethodEnum
 from .protocol_structures import (
@@ -121,6 +128,22 @@ from .protocol_structures import (
     ResponseMessage,
 )
 from .rpc_protocol import RpcProtocol
+from .sake import (
+    SakeCallParams,
+    SakeConnectChainParams,
+    SakeContext,
+    SakeCreateChainParams,
+    SakeDeployParams,
+    SakeGetAbiParams,
+    SakeGetAbiWithProxyParams,
+    SakeGetBalancesParams,
+    SakeLoadStateParams,
+    SakeLoadWorkspaceStateParams,
+    SakeParams,
+    SakeSetBalancesParams,
+    SakeSetLabelParams,
+    SakeTransactParams,
+)
 from .server_capabilities import (
     FileOperationFilter,
     FileOperationPattern,
@@ -132,7 +155,7 @@ from .server_capabilities import (
     ServerCapabilitiesWorkspaceFileOperations,
     WorkspaceFoldersServerCapabilities,
 )
-from .utils.uri import uri_to_path
+from .utils.uri import path_to_uri, uri_to_path
 
 logger = get_logger(__name__)
 
@@ -162,15 +185,17 @@ def key_in_nested_dict(key: Tuple, d: Dict) -> bool:
 
 
 class LspServer:
-    __initialized: bool
+    __initialized: bool  # signals initialize request was received
     __tfs_version: Optional[str]
     __cli_config: WakeConfig
     __workspaces: Dict[Path, LspContext]
+    __workspace_lock: asyncio.Lock
+    __initialized_event: asyncio.Event  # signals initialized notification logic finished
     __user_config: Optional[WakeConfig]
     __main_workspace: Optional[LspContext]
+    __sake_context: Optional[SakeContext]
     __workspace_path: Optional[Path]
     __protocol: RpcProtocol
-    __run: bool
     __request_id_counter: int
     __sent_requests: Dict[Union[int, str], asyncio.Event]
     __message_responses: Dict[Union[int, str], ResponseMessage]
@@ -191,11 +216,13 @@ class LspServer:
         self.__initialized = False
         self.__cli_config = config
         self.__workspaces = {}
+        self.__workspace_lock = asyncio.Lock()
+        self.__initialized_event = asyncio.Event()
         self.__user_config = None
         self.__main_workspace = None
+        self.__sake_context = None
         self.__workspace_path = None
         self.__protocol = RpcProtocol(reader, writer)
-        self.__run = True
         self.__request_id_counter = 0
         self.__sent_requests = {}
         self.__message_responses = {}
@@ -249,6 +276,166 @@ class LspServer:
             RequestMethodEnum.COMPLETION: (self._workspace_route, CompletionParams),
             RequestMethodEnum.CODE_ACTION: (self._workspace_route, CodeActionParams),
             RequestMethodEnum.INLAY_HINT: (self._workspace_route, InlayHintParams),
+            RequestMethodEnum.WORKSPACE_SYMBOL: (
+                lambda params: (
+                    workspace_symbol(
+                        self.__main_workspace,  # pyright: ignore reportArgumentType
+                        params,
+                    )
+                ),
+                WorkspaceSymbolParams,
+            ),
+            RequestMethodEnum.WORKSPACE_SYMBOL_RESOLVE: (
+                lambda params: (
+                    workspace_symbol_resolve(
+                        self.__main_workspace,  # pyright: ignore reportArgumentType
+                        params,
+                    )
+                ),
+                WorkspaceSymbol,
+            ),
+            RequestMethodEnum.WORKSPACE_TEXT_DOCUMENT_CONTENT: (
+                self._workspace_text_document_content,
+                TextDocumentContentParams,
+            ),
+            RequestMethodEnum.SAKE_CREATE_CHAIN: (
+                lambda params: (
+                    self.__sake_context.create_chain(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeCreateChainParams,
+            ),
+            RequestMethodEnum.SAKE_PING: (
+                lambda params: (
+                    self.__sake_context.ping()  # pyright: ignore reportAttributeAccessIssue
+                ),
+                None,
+            ),
+            RequestMethodEnum.SAKE_LOAD_WORKSPACE_STATE: (
+                lambda params: (
+                    self.__sake_context.load_workspace_state(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeLoadWorkspaceStateParams,
+            ),
+            RequestMethodEnum.SAKE_SAVE_WORKSPACE_STATE: (
+                lambda params: (
+                    self.__sake_context.save_workspace_state()  # pyright: ignore reportAttributeAccessIssue
+                ),
+                None,
+            ),
+            RequestMethodEnum.SAKE_CONNECT_CHAIN: (
+                lambda params: (
+                    self.__sake_context.connect_chain(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeConnectChainParams,
+            ),
+            RequestMethodEnum.SAKE_DISCONNECT_CHAIN: (
+                lambda params: (
+                    self.__sake_context.disconnect_chain(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeParams,
+            ),
+            RequestMethodEnum.SAKE_DUMP_STATE: (
+                lambda params: (
+                    self.__sake_context.dump_state(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeParams,
+            ),
+            RequestMethodEnum.SAKE_LOAD_STATE: (
+                lambda params: (
+                    self.__sake_context.load_state(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeLoadStateParams,
+            ),
+            RequestMethodEnum.SAKE_COMPILE: (
+                lambda params: (
+                    self.__sake_context.compile()  # pyright: ignore reportAttributeAccessIssue
+                ),
+                None,
+            ),
+            RequestMethodEnum.SAKE_GET_ACCOUNTS: (
+                lambda params: (
+                    self.__sake_context.get_accounts(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeParams,
+            ),
+            RequestMethodEnum.SAKE_DEPLOY: (
+                lambda params: (
+                    self.__sake_context.deploy(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeDeployParams,
+            ),
+            RequestMethodEnum.SAKE_TRANSACT: (
+                lambda params: (
+                    self.__sake_context.transact(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeTransactParams,
+            ),
+            RequestMethodEnum.SAKE_CALL: (
+                lambda params: (
+                    self.__sake_context.call(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeCallParams,
+            ),
+            RequestMethodEnum.SAKE_SET_LABEL: (
+                lambda params: (
+                    self.__sake_context.set_label(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeSetLabelParams,
+            ),
+            RequestMethodEnum.SAKE_GET_BALANCES: (
+                lambda params: (
+                    self.__sake_context.get_balances(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeGetBalancesParams,
+            ),
+            RequestMethodEnum.SAKE_SET_BALANCES: (
+                lambda params: (
+                    self.__sake_context.set_balances(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeSetBalancesParams,
+            ),
+            RequestMethodEnum.SAKE_GET_ABI: (
+                lambda params: (
+                    self.__sake_context.get_abi(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeGetAbiParams,
+            ),
+            RequestMethodEnum.SAKE_GET_ABI_WITH_PROXY: (
+                lambda params: (
+                    self.__sake_context.get_abi_with_proxy(  # pyright: ignore reportAttributeAccessIssue
+                        params,
+                    )
+                ),
+                SakeGetAbiWithProxyParams,
+            ),
         }
 
         self.__notification_mapping = {
@@ -258,7 +445,7 @@ class LspServer:
             RequestMethodEnum.LOG_TRACE: (self._log_trace, LogTraceParams),
             RequestMethodEnum.SET_TRACE: (self._set_trace, SetTraceParams),
             RequestMethodEnum.TEXT_DOCUMENT_DID_OPEN: (
-                self._text_document_did_open,
+                self._workspace_route,
                 DidOpenTextDocumentParams,
             ),
             RequestMethodEnum.TEXT_DOCUMENT_DID_CHANGE: (
@@ -316,9 +503,12 @@ class LspServer:
 
             logger.exception(e)
             try:
-                t = asyncio.create_task(
-                    self.log_message(traceback.format_exc(), MessageType.ERROR)
-                )
+
+                async def log(exc: str) -> None:
+                    await self.log_message(exc, MessageType.ERROR)
+                    await self.show_message(exc, MessageType.ERROR)
+
+                t = asyncio.create_task(log(traceback.format_exc()))
                 t.add_done_callback(_callback)
             except Exception as e:
                 logger.exception(e)
@@ -353,12 +543,53 @@ class LspServer:
         except asyncio.CancelledError:
             pass
 
+    async def close(self) -> None:
+        for workspace in self.__workspaces.values():
+            try:
+                await workspace.compiler.stop()
+            except Exception:
+                pass
+
+        if self.__sake_context is not None:
+            for session_id, (_, chain_handle) in self.__sake_context.chains.items():
+                try:
+                    dump = await self.__sake_context.dump_state(
+                        SakeParams(session_id=session_id)
+                    )
+                    await self.send_notification(
+                        RequestMethodEnum.SAKE_DUMP_STATE,
+                        {
+                            "session_id": session_id,
+                            "metadata": dump.metadata,
+                            "chain_dump": dump.chain_dump,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    chain_handle.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+            try:
+                workspace_dump = await self.__sake_context.save_workspace_state()
+                await self.send_notification(
+                    RequestMethodEnum.SAKE_SAVE_WORKSPACE_STATE,
+                    {"state": workspace_dump.state},
+                )
+            except Exception:
+                pass
+
+        self.__method_mapping.clear()
+        self.__notification_mapping.clear()
+
     async def _main_task(self) -> None:
         messages_queue = asyncio.Queue()
         self.create_task(self._messages_loop(messages_queue))
 
         try:
-            while self.__run:
+            while True:
                 message = await self.__protocol.receive()
                 if isinstance(message, ResponseMessage):
                     await self._handle_response(message)
@@ -366,9 +597,6 @@ class LspServer:
                     await messages_queue.put(message)
         except ConnectionError:
             pass
-
-        for task in self.__running_tasks:
-            task.cancel()
 
     async def _messages_loop(self, queue: asyncio.Queue) -> NoReturn:
         while True:
@@ -506,14 +734,17 @@ class LspServer:
         logger.info(f"Message received: {request}")
 
         # Init before request needed
-        if request.method != RequestMethodEnum.INITIALIZE and not self.__initialized:
-            response = self._serve_error(
-                request,
-                ErrorCodes.ServerNotInitialized,
-                "Server has not been initialized",
-            )
-            await self.__protocol.send(response)
-            return
+        if request.method != RequestMethodEnum.INITIALIZE:
+            if not self.__initialized:
+                response = self._serve_error(
+                    request,
+                    ErrorCodes.ServerNotInitialized,
+                    "Server has not been initialized",
+                )
+                await self.__protocol.send(response)
+                return
+
+            await self.__initialized_event.wait()
 
         # Handling request
         try:
@@ -528,6 +759,9 @@ class LspServer:
         if not self.__initialized and notification.method != RequestMethodEnum.EXIT:
             return
 
+        if notification.method != RequestMethodEnum.INITIALIZED:
+            await self.__initialized_event.wait()
+
         try:
             n, params_type = self.__notification_mapping[notification.method]
         except KeyError:
@@ -537,7 +771,7 @@ class LspServer:
             raise NotImplementedError()
 
         if params_type is not None:
-            await n(params_type.parse_obj(notification.params))
+            await n(params_type.model_validate(notification.params))
         else:
             await n(None)
 
@@ -564,7 +798,7 @@ class LspServer:
             raise NotImplementedError()
 
         if params_type is not None:
-            response = await m(params_type.parse_obj(request.params))
+            response = await m(params_type.model_validate(request.params))
         else:
             response = await m(None)
 
@@ -675,6 +909,9 @@ class LspServer:
                 resolve_provider=False,
             ),
             inlay_hint_provider=True,
+            workspace_symbol_provider=WorkspaceSymbolOptions(
+                resolve_provider=True,
+            ),
         )
         return InitializeResult(capabilities=server_capabilities, server_info=None)
 
@@ -693,7 +930,8 @@ class LspServer:
         pass
 
     async def _shutdown(self, params: Any) -> None:
-        self.__run = False
+        for task in self.__running_tasks:
+            task.cancel()
 
     async def _parse_config(
         self, raw_config: dict, workspace_path: Path
@@ -861,9 +1099,9 @@ class LspServer:
                     config.load_configs()
 
                     local_config_path = context.toml_path
-                    config_update = config.todict()
+                    new_config = config.todict()
                     removed_options = set()
-                    changed = config_clone.update(config_update, removed_options)
+                    changed = config_clone.set(new_config, removed_options)
                 except tomli.TOMLDecodeError:
                     await self.log_message(
                         f"Failed to parse {context.toml_path}.",
@@ -882,7 +1120,7 @@ class LspServer:
             else:
                 local_config_path = context.config.local_config_path  # still the same
                 changed = {}
-                config_update = {}
+                new_config = context.config.todict()
                 removed_options = set()
         else:
             raw_config_copy = deepcopy(raw_config)
@@ -894,16 +1132,18 @@ class LspServer:
                 raw_config_copy, context.config.project_root_path
             )
 
-            config_update = raw_config_copy
+            new_config = raw_config_copy
             local_config_path = context.config.local_config_path
             removed_options = invalid_options.union(removed_options)
-            changed = config_clone.update(config_update, removed_options)
+            changed = config_clone.set(new_config, removed_options)
 
         await context.compiler.update_config(
-            config_update, removed_options, local_config_path
+            new_config, removed_options, local_config_path
         )
 
-        if key_in_nested_dict(("compiler", "solc"), changed):
+        if key_in_nested_dict(("compiler", "solc"), changed) or key_in_nested_dict(
+            ("subproject",), changed
+        ):
             await context.compiler.force_recompile()
         if (
             key_in_nested_dict(("lsp", "detectors"), changed)
@@ -937,7 +1177,7 @@ class LspServer:
                     RegistrationParams(
                         registrations=[
                             Registration(
-                                id="watched-files-toml",
+                                id="wake-watched-files",
                                 method="workspace/didChangeWatchedFiles",
                                 register_options=DidChangeWatchedFilesRegistrationOptions(
                                     watchers=[
@@ -946,9 +1186,17 @@ class LspServer:
                                             kind=None,
                                         ),
                                         FileSystemWatcher(
+                                            glob_pattern="**/*.sol",
+                                            kind=None,
+                                        ),
+                                        FileSystemWatcher(  # whole dir containing *.{toml,sol} may be deleted
+                                            glob_pattern="**/*/",
+                                            kind=WatchKind.DELETE,
+                                        ),
+                                        FileSystemWatcher(
                                             glob_pattern=RelativePattern(
                                                 base_uri=URI(
-                                                    str(
+                                                    path_to_uri(
                                                         self.__workspace_path
                                                         / "detectors"
                                                     )
@@ -960,7 +1208,7 @@ class LspServer:
                                         FileSystemWatcher(
                                             glob_pattern=RelativePattern(
                                                 base_uri=URI(
-                                                    str(
+                                                    path_to_uri(
                                                         self.__cli_config.global_data_path
                                                         / "global-detectors"
                                                     )
@@ -972,7 +1220,7 @@ class LspServer:
                                         FileSystemWatcher(
                                             glob_pattern=RelativePattern(
                                                 base_uri=URI(
-                                                    str(
+                                                    path_to_uri(
                                                         self.__workspace_path
                                                         / "printers"
                                                     )
@@ -984,7 +1232,7 @@ class LspServer:
                                         FileSystemWatcher(
                                             glob_pattern=RelativePattern(
                                                 base_uri=URI(
-                                                    str(
+                                                    path_to_uri(
                                                         self.__cli_config.global_data_path
                                                         / "global-printers"
                                                     )
@@ -1004,15 +1252,22 @@ class LspServer:
                 self.__workspace_path
             )
             self.__main_workspace = LspContext(self, config, True)
+            self.__sake_context = SakeContext(self.__main_workspace)
             self.__main_workspace.use_toml = use_toml
             self.__main_workspace.toml_path = toml_path
             self.__workspaces[self.__workspace_path] = self.__main_workspace
             self.__main_workspace.run()
 
+        self.__initialized_event.set()
+
     async def _workspace_did_change_watched_files(
         self, params: DidChangeWatchedFilesParams
     ) -> None:
         latest_configuration = None
+
+        if self.__main_workspace is not None:
+            for ch in params.changes:
+                await self.__main_workspace.compiler.add_change(ch)
 
         for context in self.__workspaces.values():
             config_clone = WakeConfig.fromdict(
@@ -1032,14 +1287,16 @@ class LspServer:
                     )
                     config.load_configs()
 
-                    config_update = config.todict()
-                    changed = config_clone.update(config_update, set())
+                    new_config = config.todict()
+                    changed = config_clone.set(new_config, set())
 
                     await context.compiler.update_config(
-                        config_update, set(), context.toml_path
+                        new_config, set(), context.toml_path
                     )
 
-                    if key_in_nested_dict(("compiler", "solc"), changed):
+                    if key_in_nested_dict(
+                        ("compiler", "solc"), changed
+                    ) or key_in_nested_dict(("subproject",), changed):
                         await context.compiler.force_recompile()
                     if (
                         key_in_nested_dict(("lsp", "detectors"), changed)
@@ -1073,7 +1330,7 @@ class LspServer:
                     await self.show_message(message, MessageType.ERROR)
                     return
             elif context.use_toml and any(
-                uri_to_path(ch.uri) == context.toml_path
+                is_relative_to(context.toml_path, uri_to_path(ch.uri))
                 and ch.type == FileChangeType.DELETED
                 for ch in params.changes
             ):
@@ -1109,34 +1366,47 @@ class LspServer:
         self, params: DidChangeConfigurationParams
     ) -> None:
         logger.debug(f"Received configuration change: {params}")
-        if "wake" in params.settings:
-            for context in self.__workspaces.values():
-                await self._handle_config_change(context, params.settings["wake"])
+
+        # it should not be relied on the settings passed in params
+        # also, changed settings in params cannot describe that a setting was removed
+        code_config = await self.get_configuration()
+        assert isinstance(code_config, list)
+        assert len(code_config) == 1
+        assert isinstance(code_config[0], dict)
+
+        for context in self.__workspaces.values():
+            await self._handle_config_change(context, code_config[0])
 
     async def _get_workspace(
         self,
         uri: DocumentUri,  # pyright: ignore reportInvalidTypeForm
     ) -> LspContext:
-        path = uri_to_path(uri)
-        matching_workspaces = []
-        for workspace in self.__workspaces.values():
-            try:
-                matching_workspaces.append(
-                    (workspace, path.relative_to(workspace.config.project_root_path))
-                )
-            except ValueError:
-                pass
+        # prevent race conditions caused by awaiting on _create_config
+        # that would cause multiple workspaces to be created for the same project root path
+        async with self.__workspace_lock:
+            path = uri_to_path(uri)
+            matching_workspaces = []
+            for workspace in self.__workspaces.values():
+                try:
+                    matching_workspaces.append(
+                        (
+                            workspace,
+                            path.relative_to(workspace.config.project_root_path),
+                        )
+                    )
+                except ValueError:
+                    pass
 
-        if len(matching_workspaces) == 0:
-            config, use_toml, toml_path = await self._create_config(path.parent)
-            context = LspContext(self, config, False)
-            context.use_toml = use_toml
-            context.toml_path = toml_path
-            self.__workspaces[path.parent] = context
-            context.run()
-            return context
-        else:
-            return min(matching_workspaces, key=lambda x: len(x[1].parts))[0]
+            if len(matching_workspaces) == 0:
+                config, use_toml, toml_path = await self._create_config(path.parent)
+                context = LspContext(self, config, False)
+                context.use_toml = use_toml
+                context.toml_path = toml_path
+                self.__workspaces[path.parent] = context
+                context.run()
+                return context
+            else:
+                return min(matching_workspaces, key=lambda x: len(x[1].parts))[0]
 
     async def _workspace_route(self, params: Any) -> Any:
         if isinstance(
@@ -1172,6 +1442,8 @@ class LspServer:
             return await prepare_rename(context, params)
         elif isinstance(params, RenameParams):
             return await rename(context, params)
+        elif isinstance(params, DidOpenTextDocumentParams):
+            return await self._text_document_did_open(context, params)
         elif isinstance(params, DidChangeTextDocumentParams):
             return await self._text_document_did_change(context, params)
         elif isinstance(params, WillSaveTextDocumentParams):
@@ -1191,27 +1463,10 @@ class LspServer:
         else:
             raise NotImplementedError(f"Unhandled request: {type(params)}")
 
-    async def _text_document_did_open(self, params: DidOpenTextDocumentParams) -> None:
-        path = uri_to_path(params.text_document.uri)
-        matching_workspaces = []
-        for workspace in self.__workspaces.values():
-            try:
-                matching_workspaces.append(
-                    (workspace, path.relative_to(workspace.config.project_root_path))
-                )
-            except ValueError:
-                pass
-
-        if len(matching_workspaces) == 0:
-            config, use_toml, toml_path = await self._create_config(path.parent)
-            context = LspContext(self, config, False)
-            context.use_toml = use_toml
-            context.toml_path = toml_path
-            self.__workspaces[path.parent] = context
-            context.run()
-        else:
-            context = min(matching_workspaces, key=lambda x: len(x[1].parts))[0]
-
+    @staticmethod
+    async def _text_document_did_open(
+        context: LspContext, params: DidOpenTextDocumentParams
+    ) -> None:
         await context.compiler.add_change(params)
         await context.parser.add_change(params)
 
@@ -1364,13 +1619,15 @@ class LspServer:
                 document_uri = DocumentUri(params.arguments[0])
                 context = await self._get_workspace(document_uri)
                 if params.arguments[1] == "detector":
-                    context.detectors_lsp_provider.get_callback(params.arguments[2])()
+                    commands = await context.compiler.run_detector_callback(
+                        params.arguments[2]
+                    )
                 else:
-                    context.printers_lsp_provider.get_callback(params.arguments[2])()
+                    commands = await context.compiler.run_printer_callback(
+                        params.arguments[2]
+                    )
 
-                commands = context.printers_lsp_provider.get_commands()
                 if len(commands) > 0:
-                    context.printers_lsp_provider.clear_commands()
                     await self.send_notification(
                         "wake/executeCommands", {"commands": commands}
                     )
@@ -1394,3 +1651,15 @@ class LspServer:
         return await self.send_request(
             RequestMethodEnum.WORKSPACE_CONFIGURATION, params
         )
+
+    async def _workspace_text_document_content(
+        self, params: TextDocumentContentParams
+    ) -> TextDocumentContentResult:
+        file = uri_to_path(params.uri)
+
+        try:
+            return TextDocumentContentResult(text=file.read_text())
+        except FileNotFoundError:
+            raise LspError(ErrorCodes.RequestFailed, f"File not found: {file}")
+        except Exception as e:
+            raise LspError(ErrorCodes.RequestFailed, f"Failed to read file {file}: {e}")

@@ -4,6 +4,7 @@ import functools
 import importlib
 import inspect
 from abc import ABC, abstractmethod
+from collections import ChainMap
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import IntEnum
@@ -41,9 +42,11 @@ from .core import (
     Address,
     Chain,
     Wei,
+    get_contracts_by_fqn,
     get_contract_from_fqn,
     get_fqn_from_address,
     get_fqn_from_creation_code,
+    process_debug_trace_for_fqn_overrides,
 )
 from .internal import UnknownEvent, read_from_memory
 from .json_rpc import JsonRpcError
@@ -444,12 +447,16 @@ class TransactionAbc(ABC, Generic[T]):
         raw_error = self.raw_error
         assert raw_error is not None
 
+        if isinstance(raw_error, Halt):
+            self._error = raw_error
+            return self._error
+
         self._error = self._chain._process_revert_data(self, raw_error.data)
         return self._error
 
     @property
     @_fetch_tx_receipt
-    def raw_error(self) -> Optional[UnknownTransactionRevertedError]:
+    def raw_error(self) -> Optional[Union[UnknownTransactionRevertedError, Halt]]:
         if self.status == TransactionStatusEnum.SUCCESS:
             return None
 
@@ -459,9 +466,16 @@ class TransactionAbc(ABC, Generic[T]):
         chain_interface = self._chain.chain_interface
 
         assert self._tx_receipt is not None
+
+        if isinstance(chain_interface, AnvilChainInterface):
+            self._fetch_trace_transaction()
+            assert self._trace_transaction is not None
+
+            if "result" not in self._trace_transaction[0] or self._trace_transaction[0]["result"] is None:
+                return Halt(self._trace_transaction[0]["error"])
+
         # due to a bug, Anvil does not return revert data for failed contract creations
         if isinstance(chain_interface, AnvilChainInterface) and self.to is not None:
-            self._fetch_trace_transaction()
             assert self._trace_transaction is not None
             output = self._trace_transaction[0]["result"]["output"]
             if output.startswith("0x"):
@@ -603,11 +617,40 @@ class TransactionAbc(ABC, Generic[T]):
         assert self._debug_trace_transaction is not None
         assert self._tx_data is not None
 
+        fqn_overrides: ChainMap[Address, Optional[str]] = ChainMap()
+
+        # process fqn_overrides for all txs before this one in the same block
+        for i in range(self.tx_index):
+            tx_before = self.block.txs[i]
+            tx_before._fetch_debug_trace_transaction()
+            process_debug_trace_for_fqn_overrides(
+                tx_before,
+                tx_before._debug_trace_transaction,  # pyright: ignore reportGeneralTypeIssues
+                fqn_overrides,
+            )
+
+        assert len(fqn_overrides.maps) == 1
+
+        contracts_by_fqn = get_contracts_by_fqn()
+
+        def fqn_to_contract_abi(fqn: str):
+            module_name, attrs = contracts_by_fqn[fqn]
+            obj = getattr(importlib.import_module(module_name), attrs[0])
+            for attr in attrs[1:]:
+                obj = getattr(obj, attr)
+            contract_abi = obj._abi
+            return obj, contract_abi
+
         return CallTrace.from_debug_trace(
-            self,
             self._debug_trace_transaction,  # pyright: ignore reportGeneralTypeIssues
             self._tx_params,
-            int(self._tx_data["gas"], 16),
+            self.chain,
+            self.to,
+            self.return_value if self.status == TransactionStatusEnum.SUCCESS else None,
+            fqn_overrides,
+            self.block_number - 1,
+            contracts_by_fqn.keys(),
+            fqn_to_contract_abi,
         )
 
     @property
@@ -742,6 +785,12 @@ class Error(TransactionRevertedError):
         "type": "error",
         "inputs": [{"internalType": "string", "name": "message", "type": "string"}],
     }
+    selector = bytes.fromhex("08c379a0")
+    message: str
+
+
+@dataclass
+class Halt(TransactionRevertedError):
     message: str
 
 
@@ -775,6 +824,7 @@ class Panic(TransactionRevertedError):
         "type": "error",
         "inputs": [{"internalType": "uint256", "name": "code", "type": "uint256"}],
     }
+    selector = bytes.fromhex("4e487b71")
     code: "PanicCodeEnum"
 
 

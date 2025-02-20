@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Optional, Set, Tuple, Union
 
 from wake.ir.enums import ModifiesStateFlag
+from wake.utils.decorators import weak_self_lru_cache
 
 from ..statements.block import Block
 from ..utils import IrInitTuple
@@ -46,7 +48,7 @@ class TryCatchClause(SolidityAbc):
     """
 
     _ast_node: SolcTryCatchClause
-    _parent: TryStatement
+    _parent: weakref.ReferenceType[TryStatement]
 
     _block: Block
     _error_name: str
@@ -79,7 +81,17 @@ class TryCatchClause(SolidityAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[Union[Block, ParameterList]]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._block
+        if self._parameters is not None:
+            yield self._parameters
 
     @property
     def block(self) -> Block:
@@ -150,7 +162,7 @@ class TryCatchClause(SolidityAbc):
         return self._parameters
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

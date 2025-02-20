@@ -65,11 +65,11 @@ class TypeHierarchyItem(LspModel):
     """
     The kind of this item.
     """
-    tags: Optional[List[SymbolTag]]
+    tags: Optional[List[SymbolTag]] = None
     """
     Tags for this item.
     """
-    detail: Optional[str]
+    detail: Optional[str] = None
     """
     More detail for this item, e.g. the signature of a function.
     """
@@ -164,7 +164,7 @@ async def prepare_type_hierarchy(
     logger.debug(
         f"Type hierarchy for file {params.text_document.uri} at position {params.position} requested"
     )
-    await context.compiler.output_ready.wait()
+    await context.compiler.compilation_ready.wait()
 
     path = uri_to_path(params.text_document.uri).resolve()
 

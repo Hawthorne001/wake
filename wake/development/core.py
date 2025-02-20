@@ -79,8 +79,8 @@ from .primitive_types import (
     fixed_bytes_map,
     fixed_list_map,
     int_map,
-    uint_map,
     uint256,
+    uint_map,
 )
 
 if TYPE_CHECKING:
@@ -180,7 +180,29 @@ class abi:
             elif isinstance(arg, (list, tuple)):
                 ret.append(cls._normalize_input(arg))
             elif dataclasses.is_dataclass(arg):
-                ret.append(cls._normalize_input(dataclasses.astuple(arg)))
+                if hasattr(arg, "_abi") and hasattr(arg, "selector"):
+                    input_names = [
+                        input["name"] for input in getattr(arg, "_abi")["inputs"]
+                    ]
+                    inputs = []
+                    fields = dataclasses.fields(arg)
+                    for name in input_names:
+                        if hasattr(arg, name):
+                            inputs.append(getattr(arg, name))
+                        else:
+                            f = next(
+                                f
+                                for f in fields
+                                if f.metadata.get("original_name", None) == name
+                            )
+                            inputs.append(getattr(arg, f.name))
+                    ret.append(cls._normalize_input(inputs))
+                else:
+                    ret.append(
+                        cls._normalize_input(
+                            [getattr(arg, f.name) for f in dataclasses.fields(arg)]
+                        )
+                    )
             else:
                 ret.append(arg)
         return ret
@@ -339,6 +361,33 @@ class abi:
 
     @classmethod
     def encode(cls, *args) -> bytes:
+        from .transactions import (
+            TransactionRevertedError,
+            UnknownTransactionRevertedError,
+        )
+
+        if (
+            len(args) == 1
+            and hasattr(args[0], "_abi")
+            and hasattr(args[0], "selector")
+            and isinstance(args[0], TransactionRevertedError)
+        ):
+            abi = args[0]._abi["inputs"]
+            if len(abi) > 0:
+                types = [
+                    eth_utils.abi.collapse_if_tuple(cast(Dict[str, Any], arg))
+                    for arg in fix_library_abi(abi)
+                ]
+                return args[0].selector + eth_abi.abi.encode(
+                    types, cls._normalize_input(args)[0]
+                )
+            else:
+                return args[0].selector
+        elif len(args) == 1 and isinstance(args[0], UnknownTransactionRevertedError):
+            return args[0].data
+        elif any(isinstance(a, TransactionRevertedError) for a in args):
+            raise ValueError("Encoding multiple errors is not supported")
+
         return eth_abi.abi.encode(
             [cls._types_from_args(a) for a in args], cls._normalize_input(args)
         )
@@ -380,6 +429,48 @@ class abi:
 
     @classmethod
     def decode(cls, data: bytes, types: Sequence[Type]) -> Any:
+        from .transactions import (
+            TransactionRevertedError,
+            UnknownTransactionRevertedError,
+        )
+
+        if (
+            len(types) == 1
+            and hasattr(types[0], "_abi")
+            and hasattr(types[0], "selector")
+            and issubclass(types[0], TransactionRevertedError)
+        ):
+            if not data.startswith(types[0].selector):
+                raise ValueError("Selector does not match data")
+
+            data = data[len(types[0].selector) :]
+            abi = types[0]._abi["inputs"]
+            if len(abi) == 0:
+                return types[0]()
+            else:
+                t = types[0]
+                hints = get_type_hints(
+                    t,  # pyright: ignore reportGeneralTypeIssues
+                    include_extras=True,
+                )
+                return cls._normalize_output(
+                    types,
+                    [
+                        eth_abi.abi.decode(
+                            [
+                                cls._types_from_type(hints[f.name])
+                                for f in dataclasses.fields(t)
+                                if f.name != "tx"
+                            ],
+                            data,
+                        )
+                    ],
+                )[0]
+        elif len(types) == 1 and issubclass(types[0], UnknownTransactionRevertedError):
+            return UnknownTransactionRevertedError(data)
+        elif any(issubclass(t, TransactionRevertedError) for t in types):
+            raise ValueError("Decoding multiple errors is not supported")
+
         ret = cls._normalize_output(
             types, eth_abi.abi.decode([cls._types_from_type(t) for t in types], data)
         )
@@ -684,7 +775,7 @@ class Account:
         self._chain = chain
 
     def __str__(self) -> str:
-        return self._chain._labels.get(self._address, str(self._address))
+        return self._chain._labels.get(self._address, f"Account({self._address})")
 
     __repr__ = __str__
 
@@ -1371,6 +1462,9 @@ class Chain(ABC):
 
     tx_callback: Optional[Callable[[TransactionAbc], None]]
 
+    def __deepcopy__(self, memo):
+        return self
+
     @abstractmethod
     def _connect_setup(
         self, min_gas_price: Optional[int], block_base_fee_per_gas: Optional[int]
@@ -1525,17 +1619,26 @@ class Chain(ABC):
                 hardfork = info["hardFork"]
                 if hardfork in {
                     "FRONTIER",
+                    "Frontier",
                     "HOMESTEAD",
+                    "Homestead",
                     "TANGERINE",
+                    "Tangerine",
                     "SPURIOUS_DRAGON",
+                    "SpuriousDragon",
                     "BYZANTIUM",
+                    "Byzantium",
                     "CONSTANTINOPLE",
+                    "Constantinople",
                     "PETERSBURG",
+                    "Petersburg",
                     "ISTANBUL",
+                    "Istanbul",
                     "MUIR_GLACIER",
+                    "MuirGlacier",
                 }:
                     self._default_tx_type = 0
-                elif hardfork == "BERLIN":
+                elif hardfork in {"BERLIN", "Berlin"}:
                     self._default_tx_type = 1
                 else:
                     self._default_tx_type = 2
@@ -1569,6 +1672,7 @@ class Chain(ABC):
                             {
                                 "type": 2,
                                 "maxPriorityFeePerGas": 0,
+                                "to": "0x0000000000000000000000000000000000000000",
                             }
                         )
                         self._default_tx_type = 2
@@ -1578,6 +1682,7 @@ class Chain(ABC):
                                 {
                                     "type": 1,
                                     "accessList": [],
+                                    "to": "0x0000000000000000000000000000000000000000",
                                 }
                             )
                             self._default_tx_type = 1
@@ -2236,7 +2341,9 @@ class Chain(ABC):
                     fqn_overrides,
                 )
             except ValueError:
-                raise UnknownTransactionRevertedError(revert_data) from None
+                e = UnknownTransactionRevertedError(revert_data)
+                e.tx = tx
+                raise e from None
         else:
             fqn = list(errors[selector].keys())[0]
 
@@ -2367,11 +2474,9 @@ class Chain(ABC):
 
             for input in fix_library_abi(abi["inputs"]):
                 if input["indexed"]:
-                    if (
-                        input["type"] in {"string", "bytes"}
-                        or input["internalType"].startswith("struct ")
-                        or input["type"].endswith("]")
-                    ):
+                    if input["type"] in {"string", "bytes", "tuple"} or input[
+                        "type"
+                    ].endswith("]"):
                         topic_type = "bytes32"
                     else:
                         topic_type = input["type"]
@@ -2456,7 +2561,7 @@ class Chain(ABC):
 
         return console_logs
 
-    def _process_call_revert(self, e: JsonRpcError) -> TransactionRevertedError:
+    def _process_call_revert_data(self, e: JsonRpcError) -> bytes:
         try:
             # Hermez does not provide revert data for estimate
             if (
@@ -2485,7 +2590,11 @@ class Chain(ABC):
         if revert_data.startswith("0x"):
             revert_data = revert_data[2:]
 
-        return self._process_revert_data(None, bytes.fromhex(revert_data))
+        return bytes.fromhex(revert_data)
+
+    def _process_call_revert(self, e: JsonRpcError) -> TransactionRevertedError:
+
+        return self._process_revert_data(None, self._process_call_revert_data(e))
 
     def _send_transaction(
         self, tx_params: TxParams, from_: Optional[Union[Account, Address, str]]
@@ -2758,7 +2867,8 @@ def get_fqn_from_address(
     addr: Address, block_number: Union[int, str], chain: Chain
 ) -> Optional[str]:
     code = chain.chain_interface.get_code(str(addr), block_number)
-    metadata = code[-53:]
+    metadata_length = int.from_bytes(code[-2:], "big")
+    metadata = code[-metadata_length - 2 : -2]
     if metadata in contracts_by_metadata:
         return contracts_by_metadata[metadata]
     else:

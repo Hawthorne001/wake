@@ -1,3 +1,4 @@
+import itertools
 from pathlib import Path, PurePath, PurePosixPath
 from typing import List
 
@@ -116,6 +117,14 @@ class SourceUnitNameResolver:
         """
         path = Path(arg).resolve()
         pure_path = PurePath(path)
-        return str(
-            PurePosixPath(pure_path.relative_to(self.__config.project_root_path))
-        )
+        for include_path in itertools.chain(
+            [self.__config.project_root_path],
+            self.__config.compiler.solc.include_paths,
+            [self.__config.wake_contracts_path],
+        ):
+            try:
+                return str(PurePosixPath(pure_path.relative_to(include_path)))
+            except ValueError:
+                pass
+
+        raise ValueError(f"File {arg} is not in the project root dir or include paths.")

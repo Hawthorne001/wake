@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Callable,
-    DefaultDict,
+    Collection,
     Dict,
     Iterable,
     List,
@@ -18,7 +18,6 @@ from typing import (
 from typing_extensions import Literal
 
 import wake.ir as ir
-from wake.lsp.common_structures import DocumentUri, Location, LspModel, Position, Range
 
 
 class HoverOptions(NamedTuple):
@@ -30,6 +29,7 @@ class CodeLensOptions(NamedTuple):
     title: str
     callback_id: Optional[str]
     callback_kind: str
+    sort_tag: str
 
 
 class InlayHintOptions(NamedTuple):
@@ -39,21 +39,34 @@ class InlayHintOptions(NamedTuple):
     padding_right: bool
     callback_id: Tuple[Optional[str], ...]
     callback_kind: str
+    sort_tag: str
 
 
-class CommandAbc(LspModel):
-    command: str
-
-
-class GoToLocationsCommand(CommandAbc):
-    uri: DocumentUri  # pyright: ignore reportInvalidTypeForm
-    position: Position
-    locations: List[Location]
+@dataclass
+class GoToLocationsCommand:
+    path: Path
+    byte_offset: int
+    locations: List[Tuple[Path, int, int]]
     multiple: Literal["peek", "gotoAndPeek", "goto"]
     no_results_message: str
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, command="goToLocations")
+    @classmethod
+    def from_offsets(
+        cls,
+        source_units: Dict[Path, ir.SourceUnit],  # unused
+        start_path: Path,
+        start_offset: int,
+        locations: Iterable[Tuple[Path, int, int]],
+        multiple: Literal["peek", "gotoAndPeek", "goto"],
+        no_results_message: str = "No results found",
+    ) -> GoToLocationsCommand:
+        return cls(
+            path=start_path,
+            byte_offset=start_offset,
+            locations=list(locations),
+            multiple=multiple,
+            no_results_message=no_results_message,
+        )
 
     @classmethod
     def from_nodes(
@@ -63,53 +76,30 @@ class GoToLocationsCommand(CommandAbc):
         multiple: Literal["peek", "gotoAndPeek", "goto"],
         no_results_message: str = "No results found",
     ) -> GoToLocationsCommand:
-        from wake.lsp.utils import path_to_uri
-
-        pos_line, pos_col = start.source_unit.get_line_col_from_byte_offset(
-            start.name_location[0]
-            if isinstance(start, ir.DeclarationAbc)
-            else start.byte_location[0]
-        )
-
-        l = []
-        for loc in locations:
-            start_line, start_col = loc.source_unit.get_line_col_from_byte_offset(
-                loc.name_location[0]
-                if isinstance(loc, ir.DeclarationAbc)
-                else loc.byte_location[0]
-            )
-            end_line, end_col = loc.source_unit.get_line_col_from_byte_offset(
-                loc.name_location[1]
-                if isinstance(loc, ir.DeclarationAbc)
-                else loc.byte_location[1]
-            )
-            l.append(
-                Location(
-                    uri=DocumentUri(path_to_uri(loc.source_unit.file)),
-                    range=Range(
-                        start=Position(line=start_line - 1, character=start_col - 1),
-                        end=Position(line=end_line - 1, character=end_col - 1),
-                    ),
-                )
-            )
-
         return cls(
-            uri=DocumentUri(path_to_uri(start.source_unit.file)),
-            position=Position(line=pos_line - 1, character=pos_col - 1),
-            locations=l,
+            path=start.source_unit.file,
+            byte_offset=(
+                start.name_location[0]
+                if isinstance(start, ir.DeclarationAbc)
+                else start.byte_location[0]
+            ),
+            locations=[
+                (loc.source_unit.file, loc.name_location[0], loc.name_location[1])
+                if isinstance(loc, ir.DeclarationAbc)
+                else (loc.source_unit.file, loc.byte_location[0], loc.byte_location[1])
+                for loc in locations
+            ],
             multiple=multiple,
             no_results_message=no_results_message,
         )
 
 
-class PeekLocationsCommand(CommandAbc):
-    uri: DocumentUri  # pyright: ignore reportInvalidTypeForm
-    position: Position
-    locations: List[Location]
+@dataclass
+class PeekLocationsCommand:
+    path: Path
+    byte_offset: int
+    locations: List[Tuple[Path, int, int]]
     multiple: Literal["peek", "gotoAndPeek", "goto"]
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, command="peekLocations")
 
     @classmethod
     def from_nodes(
@@ -118,131 +108,105 @@ class PeekLocationsCommand(CommandAbc):
         locations: Iterable[ir.IrAbc],
         multiple: Literal["peek", "gotoAndPeek", "goto"],
     ) -> PeekLocationsCommand:
-        from wake.lsp.utils import path_to_uri
-
-        pos_line, pos_col = start.source_unit.get_line_col_from_byte_offset(
-            start.name_location[0]
-            if isinstance(start, ir.DeclarationAbc)
-            else start.byte_location[0]
-        )
-
-        l = []
-        for loc in locations:
-            start_line, start_col = loc.source_unit.get_line_col_from_byte_offset(
-                loc.name_location[0]
-                if isinstance(loc, ir.DeclarationAbc)
-                else loc.byte_location[0]
-            )
-            end_line, end_col = loc.source_unit.get_line_col_from_byte_offset(
-                loc.name_location[1]
-                if isinstance(loc, ir.DeclarationAbc)
-                else loc.byte_location[1]
-            )
-            l.append(
-                Location(
-                    uri=DocumentUri(path_to_uri(loc.source_unit.file)),
-                    range=Range(
-                        start=Position(line=start_line - 1, character=start_col - 1),
-                        end=Position(line=end_line - 1, character=end_col - 1),
-                    ),
-                )
-            )
-
         return cls(
-            uri=DocumentUri(path_to_uri(start.source_unit.file)),
-            position=Position(line=pos_line - 1, character=pos_col - 1),
-            locations=l,
+            path=start.source_unit.file,
+            byte_offset=(
+                start.name_location[0]
+                if isinstance(start, ir.DeclarationAbc)
+                else start.byte_location[0]
+            ),
+            locations=[
+                (loc.source_unit.file, loc.name_location[0], loc.name_location[1])
+                if isinstance(loc, ir.DeclarationAbc)
+                else (loc.source_unit.file, loc.byte_location[0], loc.byte_location[1])
+                for loc in locations
+            ],
             multiple=multiple,
         )
 
 
-class OpenCommand(CommandAbc):
-    uri: DocumentUri  # pyright: ignore reportInvalidTypeForm
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, command="open")
+@dataclass
+class OpenCommand:
+    uri: str
 
 
-class CopyToClipboardCommand(CommandAbc):
+@dataclass
+class CopyToClipboardCommand:
     text: str
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, command="copyToClipboard")
+
+@dataclass
+class ShowMessageCommand:
+    message: str
+    kind: Literal["info", "warning", "error"]
 
 
-class ShowDotCommand(CommandAbc):
-    command = "showDot"
+@dataclass
+class ShowDotCommand:
+    title: str
     dot: str
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs, command="showDot")
+
+CommandType = Union[
+    GoToLocationsCommand,
+    PeekLocationsCommand,
+    OpenCommand,
+    CopyToClipboardCommand,
+    ShowMessageCommand,
+    ShowDotCommand,
+]
 
 
 class LspProvider:
-    _hovers: DefaultDict[Path, DefaultDict[Tuple[int, int], Set[HoverOptions]]]
-    _code_lenses: DefaultDict[Path, DefaultDict[Tuple[int, int], Set[CodeLensOptions]]]
-    _inlay_hints: DefaultDict[Path, DefaultDict[int, Set[InlayHintOptions]]]
-    _commands: List[CommandAbc]
-    _callbacks: Dict[str, Callable[[], None]]
+    _hovers: Dict[Path, Dict[Tuple[int, int], Set[HoverOptions]]]
+    _code_lenses: Dict[Path, Dict[Tuple[int, int], Set[CodeLensOptions]]]
+    _inlay_hints: Dict[Path, Dict[int, Set[InlayHintOptions]]]
+    _commands: List[CommandType]
+    _callbacks: Dict[str, Tuple[str, Callable[[], None]]]
     _callback_counter: int
     _callback_kind: str
+    _current_sort_tag: str
 
     def __init__(self, callback_kind: str) -> None:
-        self._hovers = defaultdict(lambda: defaultdict(set))
-        self._code_lenses = defaultdict(lambda: defaultdict(set))
-        self._inlay_hints = defaultdict(lambda: defaultdict(set))
+        self._hovers = {}
+        self._code_lenses = {}
+        self._inlay_hints = {}
         self._commands = []
         self._callbacks = {}
         self._callback_counter = 0
         self._callback_kind = callback_kind
 
-    def add_commands(self, commands: List[CommandAbc]) -> None:
+    def add_commands(self, commands: List[CommandType]) -> None:
         self._commands.extend(commands)
 
-    def get_commands(self) -> Tuple[CommandAbc, ...]:
+    def get_commands(self) -> Tuple[CommandType, ...]:
         return tuple(self._commands)
 
-    def get_callback(self, callback_id: str) -> Callable[[], None]:
+    def get_callback(self, callback_id: str) -> Tuple[str, Callable[[], None]]:
         return self._callbacks[callback_id]
 
-    def get_hovers(
-        self, path: Path, byte_offset: int, nested_most_node_offsets: Tuple[int, int]
-    ) -> Set[HoverOptions]:
-        ret = set()
-        for (start, end), hovers in self._hovers[path].items():
-            for hover in hovers:
-                if not (start <= byte_offset <= end):
-                    continue
-                if (
-                    hover.on_child
-                    or nested_most_node_offsets[0] == start
-                    and nested_most_node_offsets[1] == end
-                ):
-                    ret.add(hover)
-        return ret
-
-    def get_code_lenses(
-        self, path: Path
-    ) -> Dict[Tuple[int, int], Set[CodeLensOptions]]:
-        return self._code_lenses[path]
-
-    def get_inlay_hints(
-        self, path: Path, offsets: Tuple[int, int]
-    ) -> Dict[int, Set[InlayHintOptions]]:
-        ret = defaultdict(set)
-        for offset, hints in self._inlay_hints[path].items():
-            if offsets[0] <= offset <= offsets[1]:
-                ret[offset].update(hints)
-        return ret
-
     def add_hover(self, node: ir.IrAbc, text: str, *, on_child: bool = False) -> None:
+        if node.source_unit.file not in self._hovers:
+            self._hovers[node.source_unit.file] = {}
+        if node.byte_location not in self._hovers[node.source_unit.file]:
+            self._hovers[node.source_unit.file][node.byte_location] = set()
+
         self._hovers[node.source_unit.file][node.byte_location].add(
             HoverOptions(text, on_child)
         )
 
     def add_hover_from_offsets(
-        self, path: Path, start: int, end: int, text: str,
+        self,
+        path: Path,
+        start: int,
+        end: int,
+        text: str,
     ) -> None:
+        if path not in self._hovers:
+            self._hovers[path] = {}
+        if (start, end) not in self._hovers[path]:
+            self._hovers[path][(start, end)] = set()
+
         self._hovers[path][(start, end)].add(HoverOptions(text, True))
 
     def add_code_lens(
@@ -250,6 +214,7 @@ class LspProvider:
         node: ir.IrAbc,
         title: str,
         *,
+        sort_tag: Optional[str] = None,
         on_click: Optional[Callable[[], None]] = None,
     ) -> None:
         self.add_code_lens_from_offsets(
@@ -257,6 +222,7 @@ class LspProvider:
             node.byte_location[0],
             node.byte_location[1],
             title,
+            sort_tag=sort_tag,
             on_click=on_click,
         )
 
@@ -267,28 +233,38 @@ class LspProvider:
         end: int,
         title: str,
         *,
+        sort_tag: Optional[str] = None,
         on_click: Optional[Callable[[], None]] = None,
     ) -> None:
+        if sort_tag is None:
+            sort_tag = self._current_sort_tag
+
         if on_click is not None:
             callback_id = f"callback_{self._callback_counter}"
-            self._callbacks[callback_id] = on_click
+            self._callbacks[callback_id] = (sort_tag, on_click)
             self._callback_counter += 1
         else:
             callback_id = None
 
+        if path not in self._code_lenses:
+            self._code_lenses[path] = {}
+        if (start, end) not in self._code_lenses[path]:
+            self._code_lenses[path][(start, end)] = set()
+
         self._code_lenses[path][(start, end)].add(
-            CodeLensOptions(title, callback_id, self._callback_kind)
+            CodeLensOptions(title, callback_id, self._callback_kind, sort_tag)
         )
 
     def add_inlay_hint(
         self,
         node: ir.IrAbc,
-        label: Union[str, Iterable[str]],
+        label: Union[str, Collection[str]],
         *,
-        tooltip: Union[Optional[str], Iterable[Optional[str]]] = None,
+        tooltip: Union[Optional[str], Collection[Optional[str]]] = None,
         on_click: Union[
-            Optional[Callable[[], None]], Iterable[Optional[Callable[[], None]]]
+            Optional[Callable[[], None]], Collection[Optional[Callable[[], None]]]
         ] = None,
+        sort_tag: Optional[str] = None,
         padding_left: bool = True,
         padding_right: bool = True,
     ) -> None:
@@ -300,23 +276,28 @@ class LspProvider:
             padding_left=padding_left,
             padding_right=padding_right,
             on_click=on_click,
+            sort_tag=sort_tag,
         )
 
     def add_inlay_hint_from_offset(
         self,
         path: Path,
         offset: int,
-        label: Union[str, Iterable[str]],
+        label: Union[str, Collection[str]],
         *,
-        tooltip: Union[Optional[str], Iterable[Optional[str]]] = None,
+        tooltip: Union[Optional[str], Collection[Optional[str]]] = None,
         on_click: Union[
-            Optional[Callable[[], None]], Iterable[Optional[Callable[[], None]]]
+            Optional[Callable[[], None]], Collection[Optional[Callable[[], None]]]
         ] = None,
+        sort_tag: Optional[str] = None,
         padding_left: bool = True,
         padding_right: bool = True,
     ) -> None:
         if isinstance(label, str):
             label = [label]
+
+        if sort_tag is None:
+            sort_tag = self._current_sort_tag
 
         if tooltip is None:
             tooltip = [None] * len(label)
@@ -326,7 +307,9 @@ class LspProvider:
         if on_click is None:
             on_click = [None] * len(label)
         elif not isinstance(on_click, (list, tuple)):
-            on_click = [on_click]
+            on_click = [on_click]  # pyright: ignore reportAssignmentType
+
+        assert isinstance(on_click, (list, tuple))
 
         if len(label) != len(tooltip) or len(label) != len(on_click):
             raise ValueError("label, tooltip and on_click must have the same length")
@@ -335,11 +318,16 @@ class LspProvider:
         for callback in on_click:
             if callback is not None:
                 callback_id = f"callback_{self._callback_counter}"
-                self._callbacks[callback_id] = callback
+                self._callbacks[callback_id] = (sort_tag, callback)
                 callback_ids.append(callback_id)
                 self._callback_counter += 1
             else:
                 callback_ids.append(None)
+
+        if path not in self._inlay_hints:
+            self._inlay_hints[path] = {}
+        if offset not in self._inlay_hints[path]:
+            self._inlay_hints[path][offset] = set()
 
         self._inlay_hints[path][offset].add(
             InlayHintOptions(
@@ -349,6 +337,7 @@ class LspProvider:
                 padding_right,
                 tuple(callback_ids),
                 self._callback_kind,
+                sort_tag,
             )
         )
 

@@ -39,6 +39,7 @@ class RequestMethodEnum(StrEnum):
     WORKSPACE_CODE_LENS_REFRESH = "workspace/codeLens/refresh"
     WORKSPACE_DIAGNOSTIC = "workspace/diagnostic"
     WORKSPACE_DIAGNOSTIC_REFRESH = "workspace/diagnostic/refresh"
+    WORKSPACE_FOLDING_RANGE_REFRESH = "workspace/foldingRange/refresh"
 
     # File Operations
     WORKSPACE_WILL_CREATE_FILES = "workspace/willCreateFiles"
@@ -50,6 +51,8 @@ class RequestMethodEnum(StrEnum):
     WORKSPACE_DID_CHANGE_WATCHED_FILES = (
         "workspace/didChangeWatchedFiles"  # Notification
     )
+    WORKSPACE_TEXT_DOCUMENT_CONTENT = "workspace/textDocumentContent"
+    WORKSPACE_TEXT_DOCUMENT_CONTENT_REFRESH = "workspace/textDocumentContent/refresh"
 
     # Text Synchronization
     TEXT_DOCUMENT_DID_OPEN = "textDocument/didOpen"  # Notification
@@ -108,13 +111,35 @@ class RequestMethodEnum(StrEnum):
     COLOR_PRESENTATION = "textDocument/colorPresentation"
     FORMATTING = "textDocument/formatting"
     RANGE_FORMATTING = "textDocument/rangeFormatting"
+    RANGES_FORMATTING = "textDocument/rangesFormatting"
     ON_TYPE_FORMATTING = "textDocument/onTypeFormatting"
     RENAME = "textDocument/rename"
     PREPARE_RENAME = "textDocument/prepareRename"
     LINKED_EDITING_RANGE = "textDocument/linkedEditingRange"
+    INLINE_COMPLETION = "textDocument/inlineCompletion"
 
     # Other
     CANCEL_REQUEST = "$/cancelRequest"
     PROGRESS = "$/progress"
     LOG_TRACE = "$/logTrace"  # Notification
     SET_TRACE = "$/setTrace"  # Notification
+
+    # Sake
+    SAKE_PING = "wake/sake/ping"
+    SAKE_LOAD_WORKSPACE_STATE = "wake/sake/loadWorkspaceState"
+    SAKE_SAVE_WORKSPACE_STATE = "wake/sake/saveWorkspaceState"
+    SAKE_CREATE_CHAIN = "wake/sake/createChain"
+    SAKE_CONNECT_CHAIN = "wake/sake/connectChain"
+    SAKE_DISCONNECT_CHAIN = "wake/sake/disconnectChain"
+    SAKE_DUMP_STATE = "wake/sake/dumpState"
+    SAKE_LOAD_STATE = "wake/sake/loadState"
+    SAKE_COMPILE = "wake/sake/compile"
+    SAKE_GET_ACCOUNTS = "wake/sake/getAccounts"
+    SAKE_DEPLOY = "wake/sake/deploy"
+    SAKE_TRANSACT = "wake/sake/transact"
+    SAKE_CALL = "wake/sake/call"
+    SAKE_SET_LABEL = "wake/sake/setLabel"
+    SAKE_GET_BALANCES = "wake/sake/getBalances"
+    SAKE_SET_BALANCES = "wake/sake/setBalances"
+    SAKE_GET_ABI = "wake/sake/getAbi"
+    SAKE_GET_ABI_WITH_PROXY = "wake/sake/getAbiWithProxy"

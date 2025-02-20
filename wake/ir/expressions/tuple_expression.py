@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache, reduce
 from operator import or_
 from typing import TYPE_CHECKING, Iterator, List, Optional, Set, Tuple, Union
@@ -9,6 +10,7 @@ from wake.ir.ast import SolcTupleExpression
 from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..statements.abc import StatementAbc
@@ -28,7 +30,7 @@ class TupleExpression(ExpressionAbc):
     """
 
     _ast_node: SolcTupleExpression
-    _parent: SolidityAbc  # TODO: make this more specific
+    _parent: weakref.ReferenceType[SolidityAbc]  # TODO: make this more specific
 
     _components: List[Optional[ExpressionAbc]]
     _is_inline_array: bool
@@ -57,7 +59,17 @@ class TupleExpression(ExpressionAbc):
 
     @property
     def parent(self) -> SolidityAbc:
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        for component in self._components:
+            if component is not None:
+                yield component
 
     @property
     def is_inline_array(self) -> bool:
@@ -91,7 +103,7 @@ class TupleExpression(ExpressionAbc):
         return tuple(self._components)
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def is_ref_to_state_variable(self) -> bool:
         return any(
             component.is_ref_to_state_variable
@@ -100,7 +112,7 @@ class TupleExpression(ExpressionAbc):
         )
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

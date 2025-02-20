@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Set, Tuple, Union
 
@@ -9,6 +10,7 @@ from wake.ir.enums import ModifiesStateFlag
 from wake.ir.expressions.abc import ExpressionAbc
 from wake.ir.statements.abc import StatementAbc
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 if TYPE_CHECKING:
     from ..yul.abc import YulAbc
@@ -33,13 +35,15 @@ class DoWhileStatement(StatementAbc):
     """
 
     _ast_node: SolcDoWhileStatement
-    _parent: Union[
-        Block,
-        DoWhileStatement,
-        ForStatement,
-        IfStatement,
-        UncheckedBlock,
-        WhileStatement,
+    _parent: weakref.ReferenceType[
+        Union[
+            Block,
+            DoWhileStatement,
+            ForStatement,
+            IfStatement,
+            UncheckedBlock,
+            WhileStatement,
+        ]
     ]
 
     _body: StatementAbc
@@ -72,7 +76,16 @@ class DoWhileStatement(StatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[Union[ExpressionAbc, StatementAbc]]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._body
+        yield self._condition
 
     @property
     def body(self) -> StatementAbc:
@@ -91,7 +104,7 @@ class DoWhileStatement(StatementAbc):
         return self._condition
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

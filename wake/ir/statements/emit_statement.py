@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, Iterator, Set, Tuple, Union
 
 from wake.ir.ast import SolcEmitStatement
 from wake.ir.utils import IrInitTuple
+from wake.utils.decorators import weak_self_lru_cache
 
 from ..abc import IrAbc, SolidityAbc
 from ..enums import ModifiesStateFlag
@@ -34,13 +36,15 @@ class EmitStatement(StatementAbc):
     """
 
     _ast_node: SolcEmitStatement
-    _parent: Union[
-        Block,
-        DoWhileStatement,
-        ForStatement,
-        IfStatement,
-        UncheckedBlock,
-        WhileStatement,
+    _parent: weakref.ReferenceType[
+        Union[
+            Block,
+            DoWhileStatement,
+            ForStatement,
+            IfStatement,
+            UncheckedBlock,
+            WhileStatement,
+        ]
     ]
 
     _event_call: FunctionCall
@@ -68,7 +72,15 @@ class EmitStatement(StatementAbc):
         Returns:
             Parent IR node.
         """
-        return self._parent
+        return super().parent
+
+    @property
+    def children(self) -> Iterator[ExpressionAbc]:
+        """
+        Yields:
+            Direct children of this node.
+        """
+        yield self._event_call
 
     @property
     def event_call(self) -> FunctionCall:
@@ -88,7 +100,7 @@ class EmitStatement(StatementAbc):
         return self._event_call
 
     @property
-    @lru_cache(maxsize=2048)
+    @weak_self_lru_cache(maxsize=2048)
     def modifies_state(
         self,
     ) -> Set[Tuple[Union[ExpressionAbc, StatementAbc, YulAbc], ModifiesStateFlag]]:

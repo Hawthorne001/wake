@@ -28,6 +28,8 @@ from wake.utils import get_class_that_defined_method, is_relative_to
 from ..core import get_logger
 
 if TYPE_CHECKING:
+    import threading
+
     import networkx as nx
     from rich.console import Console
 
@@ -181,7 +183,9 @@ def run_printers(
     capture_exceptions: bool = False,
     logging_handler: Optional[logging.Handler] = None,
     extra: Optional[Dict[Any, Any]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ):
+    from wake.core.exceptions import ThreadCancelledError
     from wake.utils import get_package_version
 
     if extra is None:
@@ -210,10 +214,19 @@ def run_printers(
                 raise
             exceptions[printer_names] = e
     elif isinstance(printer_names, list):
-        # TODO config only and exclude
+        if config.printers.only is None:
+            only = set(printer_names)
+        else:
+            only = set(config.printers.only)
+
         for printer_name in printer_names:
-            if printer_name == "list":
+            if (
+                printer_name not in only
+                or printer_name in config.printers.exclude
+                or printer_name == "list"
+            ):
                 continue
+
             command = run_print.get_command(
                 None,  # pyright: ignore reportGeneralTypeIssues
                 printer_name,
@@ -237,8 +250,14 @@ def run_printers(
     visit_all_printers: Set[str] = set()
 
     for command in list(printers):
+        if cancel_event is not None and cancel_event.is_set():
+            raise ThreadCancelledError()
+
         assert command is not None
         assert command.name is not None
+
+        if lsp_provider is not None:
+            lsp_provider._current_sort_tag = command.name
 
         if hasattr(config.printer, command.name):
             default_map = getattr(config.printer, command.name)
@@ -380,6 +399,9 @@ def run_printers(
         paths = []
 
     for path, source_unit in build.source_units.items():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ThreadCancelledError()
+
         # TODO config printers ignore paths
 
         target_printers = visit_all_printers
@@ -391,6 +413,9 @@ def run_printers(
 
         for node in source_unit:
             for printer_name in list(target_printers):
+                if lsp_provider is not None:
+                    lsp_provider._current_sort_tag = printer_name
+
                 printer = collected_printers[printer_name]
                 try:
                     printer.visit_ir_abc(node)
@@ -407,6 +432,12 @@ def run_printers(
                     del collected_printers[printer_name]
 
     for printer_name, printer in collected_printers.items():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ThreadCancelledError()
+
+        if lsp_provider is not None:
+            lsp_provider._current_sort_tag = printer_name
+
         try:
             printer.print()
         except Exception as e:
