@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bullseye
+FROM python:3.12.7-slim-bullseye
 
 LABEL maintainer=Ackee-Blockchain
 LABEL desc="Python-based development and testing framework for Solidity"
